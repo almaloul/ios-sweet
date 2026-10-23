@@ -151,13 +151,16 @@ internal sealed class BTree
     readonly byte[] root;
     readonly bool physical;
     readonly int keySize, valSize, nodeSize;
+    readonly ulong childBase;
 
     const ushort BtnodeRoot = 1, BtnodeLeaf = 2, BtnodeFixed = 4;
 
-    public BTree(ApfsContainer c, ulong rootOid, Dictionary<ulong, ulong>? omap)
+    /// childBase: sealed volumes store virtual child oids relative to the tree's root oid.
+    public BTree(ApfsContainer c, ulong rootOid, Dictionary<ulong, ulong>? omap, ulong childBase = 0)
     {
         this.c = c;
         this.omap = omap;
+        this.childBase = childBase;
         ulong paddr = omap == null ? rootOid : Resolve(omap, rootOid);
         root = c.ReadBlock(paddr);
         var info = root.AsSpan(root.Length - 40);
@@ -221,7 +224,7 @@ internal sealed class BTree
             {
                 // Index value: child oid (hashed trees append the child's hash).
                 ulong child = BinaryPrimitives.ReadUInt64LittleEndian(entries[i].V);
-                ulong paddr = physical ? child : Resolve(omap!, child);
+                ulong paddr = physical ? child : Resolve(omap!, childBase + child);
                 stack.Push(c.ReadBlock(paddr));
             }
         }
@@ -313,7 +316,8 @@ public sealed class ApfsVolume
         if (Encrypted) throw new NotSupportedException($"APFS volume \"{Name}\" is encrypted");
         var omap = c.LoadOmap(omapOid, c.Xid);
         // OBJ_PHYSICAL (0x40000000) in the tree type: the root oid is a block address.
-        var tree = new BTree(c, rootTreeOid, (rootTreeType & 0x40000000) != 0 ? null : omap);
+        bool physicalRoot = (rootTreeType & 0x40000000) != 0;
+        var tree = new BTree(c, rootTreeOid, physicalRoot ? null : omap, Sealed && !physicalRoot ? rootTreeOid : 0);
         foreach (var (k, v) in tree.Records())
         {
             ulong hdr = BinaryPrimitives.ReadUInt64LittleEndian(k);

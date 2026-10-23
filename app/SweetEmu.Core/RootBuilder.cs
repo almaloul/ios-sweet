@@ -46,16 +46,28 @@ public static class RootBuilder
                 if (vols.Count == 0) throw new InvalidDataException($"{what}: no readable APFS volume");
                 // The volume with a System folder (cryptexes have exactly one volume anyway).
                 ApfsVolume? pick = null;
+                Exception? firstError = null;
+                var loaded = new List<ApfsVolume>();
                 foreach (var v in vols)
                 {
-                    v.Load();
+                    try
+                    {
+                        v.Load();
+                    }
+                    catch (Exception e) when (e is InvalidDataException or NotSupportedException or IOException)
+                    {
+                        Log($"  volume \"{v.Name}\" (role 0x{v.Role:x}) unreadable: {e.Message}");
+                        firstError ??= e;
+                        continue;
+                    }
+                    loaded.Add(v);
                     if (v.Children.TryGetValue(ApfsVolume.RootDirId, out var kids) && kids.Any(k => k.Name == "System"))
                     {
                         pick = v;
                         break;
                     }
                 }
-                pick ??= vols[0];
+                pick ??= loaded.FirstOrDefault() ?? throw new InvalidDataException($"{what}: {firstError?.Message}", firstError);
                 Log($"  volume \"{pick.Name}\"{(pick.Sealed ? " (sealed)" : "")}: {pick.Inodes.Count} inodes");
                 return ApfsImport.Import(pick, w => Log("  warning: " + w));
             }

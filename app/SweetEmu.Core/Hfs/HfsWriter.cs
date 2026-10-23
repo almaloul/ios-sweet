@@ -240,7 +240,7 @@ public sealed class HfsWriter
         foreach (var it in writeOrder)
         {
             cancel.ThrowIfCancellationRequested();
-            f.Position = (long)it.Alloc.StartBlock * BlockSize;
+            f.Position = (long)it.Alloc!.StartBlock * BlockSize;
             if (it.SymlinkData != null)
             {
                 f.Write(it.SymlinkData);

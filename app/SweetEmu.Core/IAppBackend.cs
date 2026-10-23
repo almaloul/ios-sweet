@@ -3,6 +3,8 @@
 // (used to preview the UI on Linux with a fake backend).
 using System;
 using System.Threading;
+// Fields may be null by design (nothing found yet); Mono rejects #nullable.
+#pragma warning disable CS8618
 
 namespace SweetEmu.Core
 {

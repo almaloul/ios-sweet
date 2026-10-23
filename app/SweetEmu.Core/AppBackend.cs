@@ -36,12 +36,12 @@ public sealed class AppBackend : IAppBackend
         }
         return new BackendStatus
         {
-            Ipsw = s.Ipsw,
-            IpswInfo = s.Ipsw != null ? lastIpswInfo : null,
-            Kernel = s.Kernel,
-            Qemu = s.Qemu,
+            Ipsw = s.Ipsw!,
+            IpswInfo = (s.Ipsw != null ? lastIpswInfo : null)!,
+            Kernel = s.Kernel!,
+            Qemu = s.Qemu!,
             RootReady = s.RootReady,
-            Problem = s.Problem,
+            Problem = s.Problem!,
         };
     }
 
