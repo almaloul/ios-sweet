@@ -27,8 +27,11 @@ public sealed class AdtNode
 
     public AdtNode? Child(string name) => Children.FirstOrDefault(c => c.Name == name);
 
-    public static AdtNode Parse(byte[] buf) => Parse(buf, ref Unsafe0);
-    static int Unsafe0;
+    public static AdtNode Parse(byte[] buf)
+    {
+        int off = 0; // fresh cursor per parse (a shared one broke the second parse in a process)
+        return Parse(buf, ref off);
+    }
 
     public static AdtNode Parse(byte[] buf, ref int off)
     {
