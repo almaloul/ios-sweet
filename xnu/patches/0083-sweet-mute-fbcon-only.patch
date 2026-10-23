@@ -1,0 +1,39 @@
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..366c930 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -283,9 +283,8 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+-	if (sweet_console_muted && !panic_active()) {
+-		return;
+-	}
++	/* sweet_console_muted only silences the framebuffer console (pe_serial.c);
++	 * a real UART (QEMU virt) keeps logging after the GUI starts. */
+ #endif
+ 
+ 	if (disableConsoleOutput) {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..661cac0 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -758,9 +758,18 @@ fbcon_transmit_ready(void)
+ 	return 1;
+ }
+ 
++extern int sweet_console_muted;  /* osfmk/console/serial_console.c, set by AppleCLCD */
++extern unsigned panic_active(void);
++
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* boot-arg sweetfb_noconsole=1: no text over the GUI (a panic draws again). */
++	if (sweet_console_muted && !panic_active()) {
++		return;
++	}
++#endif
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
