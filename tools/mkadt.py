@@ -2,7 +2,11 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--virt]
+
+--virt is the tree for the full iOS boot on QEMU virt (tools/sweet-virt.py,
+docs/VIRT.md): --qemu + --highmem plus a /sweet-virtio node for the
+virtio-mmio root disk and input (bsd/dev/sweet_virtio.c).
 """
 import hashlib, os, struct, sys
 
@@ -38,6 +42,10 @@ VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+# QEMU virt: 32 virtio-mmio transports of 0x200 bytes
+QEMU_VIRTIO, QEMU_VIRTIO_SIZE = 0x0a000000, 0x4000
+# QEMU virt PL011: the kernel console with SWEET.h's VMAPPLE_UART (patch 0082)
+QEMU_UART, QEMU_UART_SIZE = 0x09000000, 0x1000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -74,8 +82,11 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, virt=False):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    virt=True: qemu + highmem + /sweet-virtio (tools/sweet-virt.py)."""
+    if virt:
+        qemu = highmem = True
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
@@ -187,7 +198,11 @@ def build(seed=None, qemu=False, highmem=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + ([node('uart0', [
+            ph(),
+            ('compatible', cstr('arm,pl011')),
+            ('reg', u64(QEMU_UART - SOC_BASE, QEMU_UART_SIZE)),
+        ])] if virt else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -202,6 +217,13 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('compatible', cstr('qcom,ufshc')),
         ('reg', u64(UFS, UFS_SIZE)),
+    ])
+
+    # bsd/dev/sweet_virtio.c: the virtio-mmio window (absolute physical reg).
+    virtio = node('sweet-virtio', [
+        ph(),
+        ('compatible', cstr('virtio,mmio')),
+        ('reg', u64(QEMU_VIRTIO, QEMU_VIRTIO_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -238,11 +260,12 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product +
+       ([virtio] if virt else [] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, virt='--virt' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

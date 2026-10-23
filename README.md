@@ -142,6 +142,10 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 
 `tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
 
+### Full iOS on QEMU (Windows, Linux, macOS)
+
+`tools/sweet-virt.py` boots the whole iOS 16 userland on QEMU `virt` in a window: the framebuffer through ramfb, the root image on virtio-blk, the mouse as the touchscreen. Kernel support is patch 0082 and `tools/mkadt.py --virt`. Work in progress; see [`docs/VIRT.md`](docs/VIRT.md).
+
 ## Repository layout
 
 | Path | What |

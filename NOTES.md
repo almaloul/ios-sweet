@@ -2,6 +2,15 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23: QEMU virt target (docs/VIRT.md) <<<
+
+Separate track from the phone work below; nothing here changes the phone boot.
+- **Goal:** boot the same kernel + iOS root image on QEMU `virt` in a window (Windows host is the target user).
+- **Added (not yet built in CI, not yet booted):** patch `0082-sweet-virt-qemu-virtio.patch` (`bsd/dev/sweet_virtio_core.h`, `bsd/dev/sweet_virtio.c`: `vblk0` root via `rd=vblk0`, polled virtio-input -> `sweet_hid_touch`/`sweet_hid_key`; `SWEET.h` `VMAPPLE_UART` for a PL011 console when the ADT has `uart0`). `tools/mkadt.py --virt` (= --qemu --highmem + `/sweet-virtio` reg 0x0a000000/0x4000 + `/arm-io/uart0` 0x09000000). `tools/sweet-virt.py` launcher; `tools/virt/stub/` pre-kernel stub that programs QEMU ramfb (fw_cfg DMA) to scan out 0x9c000000 1080x2400 XRGB8888, then jumps to XNU.
+- **Observed (QEMU 8.2, no XNU):** `tools/virt/selftest/run.py` PASS (virtio-blk read/write/flush/ring wrap; tablet taps scaled to panel px; keys). `launcher_test.py` PASS headless and with `-display gtk` under Xvfb (screendump pixels match what the stand-in kernel drew; serial logfile tee works).
+- **Checked only roughly:** `sweet_virtio.c` passes `clang -fsyntax-only` against the patched xnu-8796 headers with stubbed generated headers (not the CI build environment).
+- **Next:** CI build with 0082 (`-k`), then `sweet-virt.py payload-virt.bin ios16-root.img --snapshot`; watch serial for `SWEET VBLK`, `SWEET VINPUT`, `SWEET HID: touch`. Then SMP on virt (PSCI conduit hvc + Aff0 MPIDR, see docs/VIRT.md roadmap).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

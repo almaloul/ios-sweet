@@ -1,0 +1,1216 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..0ef6dd0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_virtio.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_virtio.c b/bsd/dev/sweet_virtio.c
+new file mode 100644
+index 0000000..341fde0
+--- /dev/null
++++ b/bsd/dev/sweet_virtio.c
+@@ -0,0 +1,616 @@
++/*
++ * SWEET on QEMU virt: virtio-mmio root disk and input.
++ *
++ * The same SWEET kernel boots on the phone and on QEMU's generic "virt"
++ * board (tools/sweet-virt.py). On virt there is no UFS, touch controller
++ * or PMIC; instead the device tree (tools/mkadt.py --virt) has a
++ * /sweet-virtio node whose reg is the virtio-mmio window (32 transports of
++ * 0x200 bytes). This file drives the modern (version 2) transports found
++ * there, polled, with the OS-independent core in sweet_virtio_core.h:
++ *
++ *   virtio-blk    the first one is the BSD disk vblk0 (rvblk0): the whole
++ *                 disk is the HFS+ iOS root image. Root on it with
++ *                 rd=vblk0. Read-write unless the device is read-only or
++ *                 boot-arg vblkrw=0.
++ *   virtio-input  tablet / multitouch / keyboard devices feed the HID event
++ *                 services (iokit/Kernel/arm/hid/SweetHID.cpp) through
++ *                 sweet_hid_touch() in panel pixels and sweet_hid_key().
++ *                 Keys: Esc/Home = Home, PgUp = volume up, PgDn = volume
++ *                 down, End = side (power) button. sweetvinput=0 disables.
++ *
++ * QEMU's TCG virtio is cache coherent and accepts 64-bit DMA addresses, so
++ * one physically contiguous allocation per device is enough and no cache
++ * maintenance is needed. Requires -global virtio-mmio.force-legacy=false.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++#include "sweet_virtio_core.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++#define VBLK_SECTOR             512u
++#define VBLK_PHYS_BLOCK         4096u
++#define VBLK_QUEUE              8u
++#define BOUNCE_SIZE             (1u << 20)
++#define CMD_TIMEOUT_NS          (30ull * NSEC_PER_SEC)
++
++/* Layout of the block device's contiguous DMA allocation. */
++#define DMA_QUEUE               0x0000
++#define DMA_HDR                 0x2000          /* header, then the status byte */
++#define DMA_BOUNCE              0x4000
++#define DMA_SIZE                (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t window;             /* kernel VA of the virtio-mmio window */
++	uint64_t window_pa, window_size;
++	struct svio_dev dev;
++	struct svio_queue q;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint64_t nsectors;              /* 512-byte device sectors */
++	uint32_t secsize;               /* logical sector size for the BSD layer */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool writable, flush, ready;
++	int panel_w, panel_h;
++} vb;
++
++static LCK_GRP_DECLARE(sweet_virtio_grp, "sweet_virtio");
++static LCK_MTX_DECLARE(sweet_virtio_lock, &sweet_virtio_grp);
++
++static void sweet_vinput_start(void);
++
++/*
++ * One request, waited for by polling: the device completes it on QEMU's
++ * I/O thread while this CPU spins (then sleeps in short steps).
++ */
++static int
++vblk_io(uint32_t type, uint64_t sector, uint32_t len)
++{
++	struct svio_blk_hdr *hdr = (struct svio_blk_hdr *)(vb.dma + DMA_HDR);
++	uint64_t deadline, now;
++	int st;
++
++	assert(len <= BOUNCE_SIZE);
++	svio_blk_start(&vb.dev, &vb.q, hdr, vb.dma_pa + DMA_HDR, type, sector,
++	    vb.dma_pa + DMA_BOUNCE, len);
++	clock_interval_to_deadline((uint32_t)(CMD_TIMEOUT_NS / NSEC_PER_MSEC), NSEC_PER_MSEC, &deadline);
++	for (unsigned spins = 0; (st = svio_blk_done(&vb.dev, &vb.q, hdr)) < 0; spins++) {
++		now = mach_absolute_time();
++		if (now > deadline) {
++			printf("SWEET VBLK: request type %u sector 0x%llx len %u timed out\n",
++			    type, sector, len);
++			return ETIMEDOUT;
++		}
++		if (spins > 2000) {
++			delay(20);
++		}
++	}
++	if (st != SVIO_BLK_S_OK) {
++		printf("SWEET VBLK: request type %u sector 0x%llx len %u status %d\n",
++		    type, sector, len, st);
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++sweet_vblk_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!vb.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !vb.writable) ? EROFS : 0;
++}
++
++static int
++sweet_vblk_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_vblk_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * vb.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t disk_bytes = vb.nsectors * VBLK_SECTOR;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !vb.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > disk_bytes || count > disk_bytes - off || (off % VBLK_SECTOR)) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&sweet_virtio_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t sector = (off + done) / VBLK_SECTOR;
++		uint32_t want = MIN(count - done, BOUNCE_SIZE);
++		uint32_t len = (want + VBLK_SECTOR - 1) / VBLK_SECTOR * VBLK_SECTOR;
++		void *bounce = (void *)(vb.dma + DMA_BOUNCE);
++
++		if (rd) {
++			error = vblk_io(SVIO_BLK_T_IN, sector, len);
++			if (!error) {
++				memcpy(vaddr + done, bounce, want);
++			}
++		} else {
++			/* A partial last sector: read it first, then merge. */
++			if (want != len) {
++				error = vblk_io(SVIO_BLK_T_IN, sector, len);
++			}
++			if (!error) {
++				memcpy(bounce, vaddr + done, want);
++				error = vblk_io(SVIO_BLK_T_OUT, sector, len);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_virtio_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++vblk_sync(void)
++{
++	if (!vb.writable || !vb.flush) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_virtio_lock);
++	int error = vblk_io(SVIO_BLK_T_FLUSH, 0, 0);
++	lck_mtx_unlock(&sweet_virtio_lock);
++	return error;
++}
++
++static int
++sweet_vblk_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = vb.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > VBLK_PHYS_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		vb.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = VBLK_PHYS_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = vb.nsectors * VBLK_SECTOR / vb.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = vb.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return vblk_sync();
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / vb.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = vb.writable ? BOUNCE_SIZE / vb.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_vblk_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_vblk_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_vblk_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_vblk_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_vblk_psize(__unused dev_t dev)
++{
++	return vb.ready ? (int)MIN(vb.nsectors * VBLK_SECTOR / vb.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_vblk_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_vblk_strategy, NULL, dev, B_READ, minphys, uio, (int)vb.secsize);
++}
++
++static int
++sweet_vblk_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!vb.writable) {
++		return EROFS;
++	}
++	return physio(sweet_vblk_strategy, NULL, dev, B_WRITE, minphys, uio, (int)vb.secsize);
++}
++
++static const struct bdevsw sweet_vblk_bdevsw = {
++	.d_open     = sweet_vblk_open,
++	.d_close    = sweet_vblk_close,
++	.d_strategy = sweet_vblk_strategy,
++	.d_ioctl    = sweet_vblk_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_vblk_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_vblk_cdevsw = {
++	.d_open       = sweet_vblk_open,
++	.d_close      = sweet_vblk_close,
++	.d_read       = sweet_vblk_read,
++	.d_write      = sweet_vblk_write,
++	.d_ioctl      = sweet_vblk_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++/* Physically contiguous, zeroed memory: kernel VA and PA. */
++static int
++vdma_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
++{
++	if (kmem_alloc_contig(kernel_map, va, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)*va);
++	if (!pn) {
++		return ENOMEM;
++	}
++	*pa = ptoa_64(pn);
++	return 0;
++}
++
++static uint32_t
++dt_u32(DTEntry node, const char *name, uint32_t dflt)
++{
++	void const *p = NULL;
++	unsigned int size = 0;
++	if (SecureDTGetProperty(node, name, &p, &size) == kSuccess && size >= sizeof(uint32_t)) {
++		return *(const uint32_t *)p;
++	}
++	return dflt;
++}
++
++static int
++sweet_vblk_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	uintptr_t blk = 0;
++	uint32_t rw = 1;
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-virtio", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET VIRTIO: no /sweet-virtio node in the device tree\n");
++		return ENXIO;
++	}
++	vb.panel_w = 1080;
++	vb.panel_h = 2400;
++	if (SecureDTLookupEntry(NULL, "/sweet-fbcon", &node) == kSuccess) {
++		vb.panel_w = (int)dt_u32(node, "width", 1080);
++		vb.panel_h = (int)dt_u32(node, "height", 2400);
++	}
++	PE_parse_boot_argn("vblkrw", &rw, sizeof(rw));
++
++	vb.window_pa = reg[0];
++	vb.window_size = reg[1];
++	vb.window = ml_io_map(reg[0], reg[1]);
++	if (!vb.window) {
++		return ENXIO;
++	}
++	for (uint32_t s = 0; s < SVIO_MAX_SLOTS && (s + 1) * SVIO_SLOT_SIZE <= vb.window_size; s++) {
++		uint32_t version;
++		uintptr_t regs = vb.window + s * SVIO_SLOT_SIZE;
++		uint32_t id = svio_probe(regs, &version);
++		if (version == 1) {
++			printf("SWEET VIRTIO: slot %u is a legacy transport; run QEMU with "
++			    "-global virtio-mmio.force-legacy=false\n", s);
++		}
++		if (id == SVIO_DEV_BLK && !blk) {
++			blk = regs;
++			printf("SWEET VIRTIO: slot %u virtio-blk\n", s);
++		}
++	}
++	if (!blk) {
++		printf("SWEET VIRTIO: no virtio-blk device\n");
++		return ENXIO;
++	}
++
++	error = vdma_alloc(DMA_SIZE, &vb.dma, &vb.dma_pa);
++	if (error) {
++		printf("SWEET VBLK: no contiguous DMA memory\n");
++		return error;
++	}
++	vb.dev.regs = blk;
++	if (svio_init(&vb.dev, SVIO_BLK_F_RO | SVIO_BLK_F_FLUSH) != 0 ||
++	    svio_queue_setup(&vb.dev, &vb.q, 0, VBLK_QUEUE, (void *)(vb.dma + DMA_QUEUE),
++	    vb.dma_pa + DMA_QUEUE) != 0) {
++		printf("SWEET VBLK: device setup failed\n");
++		return EIO;
++	}
++	svio_driver_ok(&vb.dev);
++	vb.nsectors = svio_cfg64(&vb.dev, 0);
++	vb.flush = (vb.dev.features & SVIO_BLK_F_FLUSH) != 0;
++	vb.secsize = DEV_BSIZE;
++	if (vb.nsectors == 0) {
++		printf("SWEET VBLK: empty disk\n");
++		return ENXIO;
++	}
++
++	vb.bmajor = bdevsw_add(-1, &sweet_vblk_bdevsw);
++	if (vb.bmajor < 0) {
++		return ENXIO;
++	}
++	vb.cmajor = cdevsw_add_with_bdev(-1, &sweet_vblk_cdevsw, vb.bmajor);
++	if (vb.cmajor < 0) {
++		return ENXIO;
++	}
++	vb.bdev = makedev(vb.bmajor, 0);
++	devfs_make_node(vb.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "vblk0");
++	devfs_make_node(makedev(vb.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rvblk0");
++	vb.writable = rw && !(vb.dev.features & SVIO_BLK_F_RO);
++	vb.ready = true;
++	printf("SWEET VBLK: %llu MiB, %s%s, DMA at 0x%llx\n",
++	    vb.nsectors * VBLK_SECTOR >> 20, vb.writable ? "read-write" : "read-only",
++	    vb.flush ? ", flush" : "", vb.dma_pa);
++
++	sweet_vinput_start();
++	return 0;
++}
++
++/* Root device for rd=vblk0 (IOFindBSDRoot). */
++int sweet_virtio_rootdev(dev_t *dev);
++
++int
++sweet_virtio_rootdev(dev_t *dev)
++{
++	if (!vb.ready) {
++		int error = sweet_vblk_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = vb.bdev;
++	return 0;
++}
++
++/* ---- input ---- */
++
++#define VINPUT_DEVS             4
++#define VINPUT_BUFS             64u
++#define VINPUT_POLL_MS          8u
++#define VINPUT_DMA_EVENTS       0x2000
++#define VINPUT_DMA_SIZE         (VINPUT_DMA_EVENTS + VINPUT_BUFS * sizeof(struct svio_input_event))
++
++/* Linux input keycodes (virtio-input uses evdev codes). */
++#define KEY_ESC                 1
++#define KEY_HOME                102
++#define KEY_PAGEUP              104
++#define KEY_END                 107
++#define KEY_PAGEDOWN            109
++#define KEY_VOLUMEDOWN          114
++#define KEY_VOLUMEUP            115
++#define KEY_POWER               116
++
++static struct vinput {
++	struct svio_dev dev;
++	struct svio_queue q;
++	struct svio_touch touch;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	struct svio_input_event *ev;
++	char name[48];
++} vin[VINPUT_DEVS];
++static int vin_count;
++static int vin_sleep_chan;
++
++/* sweet_hid_key(): 0 power (side button), 1 volume up, 2 volume down, 3 home */
++static void
++vinput_key(uint16_t code, int down)
++{
++	int key;
++
++	switch (code) {
++	case KEY_ESC:
++	case KEY_HOME:
++		key = 3;
++		break;
++	case KEY_PAGEUP:
++	case KEY_VOLUMEUP:
++		key = 1;
++		break;
++	case KEY_PAGEDOWN:
++	case KEY_VOLUMEDOWN:
++		key = 2;
++		break;
++	case KEY_END:
++	case KEY_POWER:
++		key = 0;
++		break;
++	default:
++		return;
++	}
++	sweet_hid_key(key, down);
++}
++
++static void
++vinput_touch(int finger, int down, int x, int y)
++{
++	sweet_hid_touch(finger, down, x, y);
++}
++
++static void
++vinput_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&vin_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++vinput_add(uintptr_t regs, uint32_t slot)
++{
++	struct vinput *v = &vin[vin_count];
++
++	if (vdma_alloc(VINPUT_DMA_SIZE, &v->dma, &v->dma_pa)) {
++		return false;
++	}
++	v->dev.regs = regs;
++	v->ev = (struct svio_input_event *)(v->dma + VINPUT_DMA_EVENTS);
++	if (svio_init(&v->dev, 0) != 0 ||
++	    svio_queue_setup(&v->dev, &v->q, 0, VINPUT_BUFS, (void *)v->dma, v->dma_pa) != 0) {
++		printf("SWEET VINPUT: slot %u setup failed\n", slot);
++		return false;
++	}
++	svio_input_name(&v->dev, v->name, sizeof(v->name));
++	struct svio_touch *t = &v->touch;
++	t->mt = svio_input_abs(&v->dev, SVIO_ABS_MT_POSITION_X, &t->xmin, &t->xmax) &&
++	    svio_input_abs(&v->dev, SVIO_ABS_MT_POSITION_Y, &t->ymin, &t->ymax);
++	if (!t->mt) {
++		(void)svio_input_abs(&v->dev, SVIO_ABS_X, &t->xmin, &t->xmax);
++		(void)svio_input_abs(&v->dev, SVIO_ABS_Y, &t->ymin, &t->ymax);
++	}
++	for (uint16_t i = 0; i < VINPUT_BUFS; i++) {
++		svio_input_post(&v->q, v->dma_pa + VINPUT_DMA_EVENTS, i);
++	}
++	svio_driver_ok(&v->dev);
++	svio_notify(&v->dev, &v->q);
++	printf("SWEET VINPUT: slot %u \"%s\" x %d..%d y %d..%d%s -> %dx%d\n",
++	    slot, v->name, t->xmin, t->xmax, t->ymin, t->ymax, t->mt ? " multitouch" : "",
++	    vb.panel_w, vb.panel_h);
++	vin_count++;
++	return true;
++}
++
++static void
++vinput_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		for (int n = 0; n < vin_count; n++) {
++			struct vinput *v = &vin[n];
++			uint32_t id, len;
++			bool any = false;
++			while (svio_pop(&v->q, &id, &len)) {
++				if (id >= VINPUT_BUFS) {
++					continue;
++				}
++				struct svio_input_event e = v->ev[id];
++				svio_touch_event(&v->touch, &e, vb.panel_w, vb.panel_h,
++				    vinput_touch, vinput_key);
++				svio_input_post(&v->q, v->dma_pa + VINPUT_DMA_EVENTS, (uint16_t)id);
++				any = true;
++			}
++			if (any) {
++				svio_ack(&v->dev);
++				svio_notify(&v->dev, &v->q);
++			}
++		}
++		vinput_wait(VINPUT_POLL_MS);
++	}
++}
++
++static void
++sweet_vinput_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetvinput", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET VINPUT: disabled (sweetvinput=0)\n");
++		return;
++	}
++	for (uint32_t s = 0; s < SVIO_MAX_SLOTS && (s + 1) * SVIO_SLOT_SIZE <= vb.window_size; s++) {
++		uint32_t version;
++		uintptr_t regs = vb.window + s * SVIO_SLOT_SIZE;
++		if (svio_probe(regs, &version) == SVIO_DEV_INPUT && vin_count < VINPUT_DEVS) {
++			(void)vinput_add(regs, s);
++		}
++	}
++	if (vin_count == 0) {
++		printf("SWEET VINPUT: no virtio-input devices\n");
++		return;
++	}
++	if (kernel_thread_start(vinput_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_virtio_core.h b/bsd/dev/sweet_virtio_core.h
+new file mode 100644
+index 0000000..9801af5
+--- /dev/null
++++ b/bsd/dev/sweet_virtio_core.h
+@@ -0,0 +1,532 @@
++/*
++ * SWEET on QEMU virt: polled virtio-mmio (transport version 2) core.
++ *
++ * No OS dependencies, so the same code runs in bsd/dev/sweet_virtio.c and
++ * in a bare-metal self-test (ios-sweet tools/virt/selftest). The caller
++ * provides MMIO-mapped register bases and physically contiguous memory
++ * (VA + PA) for queues and buffers. QEMU's TCG virtio is cache coherent,
++ * so only ordering barriers are needed, no cache maintenance.
++ *
++ * Little-endian guest only (arm64).
++ */
++#ifndef SWEET_VIRTIO_CORE_H
++#define SWEET_VIRTIO_CORE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SVIO_MAGIC              0x74726976u     /* "virt" */
++
++#define SVIO_REG_MAGIC          0x000
++#define SVIO_REG_VERSION        0x004
++#define SVIO_REG_DEVICE_ID      0x008
++#define SVIO_REG_DEV_FEAT       0x010
++#define SVIO_REG_DEV_FEAT_SEL   0x014
++#define SVIO_REG_DRV_FEAT       0x020
++#define SVIO_REG_DRV_FEAT_SEL   0x024
++#define SVIO_REG_QUEUE_SEL      0x030
++#define SVIO_REG_QUEUE_NUM_MAX  0x034
++#define SVIO_REG_QUEUE_NUM      0x038
++#define SVIO_REG_QUEUE_READY    0x044
++#define SVIO_REG_QUEUE_NOTIFY   0x050
++#define SVIO_REG_INT_STATUS     0x060
++#define SVIO_REG_INT_ACK        0x064
++#define SVIO_REG_STATUS         0x070
++#define SVIO_REG_QUEUE_DESC     0x080
++#define SVIO_REG_QUEUE_DRIVER   0x090
++#define SVIO_REG_QUEUE_DEVICE   0x0a0
++#define SVIO_REG_CONFIG_GEN     0x0fc
++#define SVIO_REG_CONFIG         0x100
++
++#define SVIO_ST_ACK             1u
++#define SVIO_ST_DRIVER          2u
++#define SVIO_ST_DRIVER_OK       4u
++#define SVIO_ST_FEATURES_OK     8u
++#define SVIO_ST_FAILED          128u
++
++#define SVIO_DEV_BLK            2u
++#define SVIO_DEV_INPUT          18u
++
++#define SVIO_DESC_NEXT          1u
++#define SVIO_DESC_WRITE         2u      /* device writes this buffer */
++
++/* virt: 32 transports of 0x200 bytes from 0x0a000000 */
++#define SVIO_SLOT_SIZE          0x200u
++#define SVIO_MAX_SLOTS          32u
++
++struct svio_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct svio_used_elem {
++	uint32_t id;
++	uint32_t len;
++};
++
++/* Queue memory: descriptors, then avail ring, then (4-aligned) used ring. */
++#define SVIO_QUEUE_BYTES(n) \
++	(((16u * (n) + 6u + 2u * (n)) + 3u) / 4u * 4u + 6u + 8u * (n))
++
++struct svio_queue {
++	volatile struct svio_desc *desc;
++	volatile uint16_t *avail;       /* flags, idx, ring[num], used_event */
++	volatile uint16_t *used;        /* flags, idx, then svio_used_elem[num] */
++	uint16_t num;
++	uint16_t index;                 /* queue number on the device */
++	uint16_t avail_idx;
++	uint16_t last_used;
++};
++
++struct svio_dev {
++	uintptr_t regs;
++	uint32_t device_id;
++	uint64_t features;              /* negotiated */
++};
++
++static inline void
++svio_mb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++svio_rd(const struct svio_dev *d, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(d->regs + off);
++	svio_mb();
++	return v;
++}
++
++static inline void
++svio_wr(const struct svio_dev *d, uint32_t off, uint32_t v)
++{
++	svio_mb();
++	*(volatile uint32_t *)(d->regs + off) = v;
++	svio_mb();
++}
++
++static inline uint8_t
++svio_cfg8(const struct svio_dev *d, uint32_t off)
++{
++	return *(volatile uint8_t *)(d->regs + SVIO_REG_CONFIG + off);
++}
++
++static inline void
++svio_cfg8_wr(const struct svio_dev *d, uint32_t off, uint8_t v)
++{
++	svio_mb();
++	*(volatile uint8_t *)(d->regs + SVIO_REG_CONFIG + off) = v;
++	svio_mb();
++}
++
++/* 32-bit config read, retried until the generation counter is stable. */
++static inline uint64_t
++svio_cfg64(const struct svio_dev *d, uint32_t off)
++{
++	uint32_t gen, lo, hi;
++	do {
++		gen = svio_rd(d, SVIO_REG_CONFIG_GEN);
++		lo = *(volatile uint32_t *)(d->regs + SVIO_REG_CONFIG + off);
++		hi = *(volatile uint32_t *)(d->regs + SVIO_REG_CONFIG + off + 4);
++		svio_mb();
++	} while (gen != svio_rd(d, SVIO_REG_CONFIG_GEN));
++	return ((uint64_t)hi << 32) | lo;
++}
++
++/* Device ID of a modern (version 2) transport at regs, 0 if empty/legacy. */
++static inline uint32_t
++svio_probe(uintptr_t regs, uint32_t *version)
++{
++	struct svio_dev d = { .regs = regs };
++	*version = 0;
++	if (svio_rd(&d, SVIO_REG_MAGIC) != SVIO_MAGIC) {
++		return 0;
++	}
++	*version = svio_rd(&d, SVIO_REG_VERSION);
++	if (*version != 2) {
++		return 0;
++	}
++	return svio_rd(&d, SVIO_REG_DEVICE_ID);
++}
++
++/*
++ * Reset and negotiate. want: device feature bits 0-31 the driver can use.
++ * VIRTIO_F_VERSION_1 (bit 32) is required. Returns 0 or -1.
++ */
++static inline int
++svio_init(struct svio_dev *d, uint32_t want)
++{
++	svio_wr(d, SVIO_REG_STATUS, 0);
++	while (svio_rd(d, SVIO_REG_STATUS) != 0) {
++	}
++	svio_wr(d, SVIO_REG_STATUS, SVIO_ST_ACK);
++	svio_wr(d, SVIO_REG_STATUS, SVIO_ST_ACK | SVIO_ST_DRIVER);
++
++	svio_wr(d, SVIO_REG_DEV_FEAT_SEL, 0);
++	uint32_t lo = svio_rd(d, SVIO_REG_DEV_FEAT);
++	svio_wr(d, SVIO_REG_DEV_FEAT_SEL, 1);
++	uint32_t hi = svio_rd(d, SVIO_REG_DEV_FEAT);
++	if (!(hi & 1u)) {
++		svio_wr(d, SVIO_REG_STATUS, SVIO_ST_FAILED);
++		return -1;
++	}
++	lo &= want;
++	svio_wr(d, SVIO_REG_DRV_FEAT_SEL, 0);
++	svio_wr(d, SVIO_REG_DRV_FEAT, lo);
++	svio_wr(d, SVIO_REG_DRV_FEAT_SEL, 1);
++	svio_wr(d, SVIO_REG_DRV_FEAT, 1u);
++	svio_wr(d, SVIO_REG_STATUS, SVIO_ST_ACK | SVIO_ST_DRIVER | SVIO_ST_FEATURES_OK);
++	if (!(svio_rd(d, SVIO_REG_STATUS) & SVIO_ST_FEATURES_OK)) {
++		svio_wr(d, SVIO_REG_STATUS, SVIO_ST_FAILED);
++		return -1;
++	}
++	d->features = ((uint64_t)1 << 32) | lo;
++	return 0;
++}
++
++/*
++ * Set up queue `index` with num entries in zeroed memory of at least
++ * SVIO_QUEUE_BYTES(num) bytes (16-byte aligned). Returns 0 or -1.
++ */
++static inline int
++svio_queue_setup(struct svio_dev *d, struct svio_queue *q, uint16_t index,
++    uint16_t num, void *mem, uint64_t mem_pa)
++{
++	uint32_t avail_off = 16u * num;
++	uint32_t used_off = (avail_off + 6u + 2u * num + 3u) / 4u * 4u;
++
++	svio_wr(d, SVIO_REG_QUEUE_SEL, index);
++	if (svio_rd(d, SVIO_REG_QUEUE_READY) != 0) {
++		return -1;
++	}
++	uint32_t max = svio_rd(d, SVIO_REG_QUEUE_NUM_MAX);
++	if (max == 0 || max < num) {
++		return -1;
++	}
++	q->desc = (volatile struct svio_desc *)mem;
++	q->avail = (volatile uint16_t *)((uintptr_t)mem + avail_off);
++	q->used = (volatile uint16_t *)((uintptr_t)mem + used_off);
++	q->num = num;
++	q->index = index;
++	q->avail_idx = 0;
++	q->last_used = 0;
++
++	svio_wr(d, SVIO_REG_QUEUE_NUM, num);
++	svio_wr(d, SVIO_REG_QUEUE_DESC, (uint32_t)mem_pa);
++	svio_wr(d, SVIO_REG_QUEUE_DESC + 4, (uint32_t)(mem_pa >> 32));
++	svio_wr(d, SVIO_REG_QUEUE_DRIVER, (uint32_t)(mem_pa + avail_off));
++	svio_wr(d, SVIO_REG_QUEUE_DRIVER + 4, (uint32_t)((mem_pa + avail_off) >> 32));
++	svio_wr(d, SVIO_REG_QUEUE_DEVICE, (uint32_t)(mem_pa + used_off));
++	svio_wr(d, SVIO_REG_QUEUE_DEVICE + 4, (uint32_t)((mem_pa + used_off) >> 32));
++	svio_wr(d, SVIO_REG_QUEUE_READY, 1);
++	return 0;
++}
++
++static inline void
++svio_driver_ok(struct svio_dev *d)
++{
++	svio_wr(d, SVIO_REG_STATUS,
++	    SVIO_ST_ACK | SVIO_ST_DRIVER | SVIO_ST_FEATURES_OK | SVIO_ST_DRIVER_OK);
++}
++
++/* Fill descriptor i. */
++static inline void
++svio_desc_set(struct svio_queue *q, uint16_t i, uint64_t pa, uint32_t len,
++    uint16_t flags, uint16_t next)
++{
++	q->desc[i].addr = pa;
++	q->desc[i].len = len;
++	q->desc[i].flags = flags;
++	q->desc[i].next = next;
++}
++
++/* Make the chain starting at head available; notify unless batching. */
++static inline void
++svio_push(struct svio_queue *q, uint16_t head)
++{
++	q->avail[2 + (q->avail_idx % q->num)] = head;
++	svio_mb();
++	q->avail_idx++;
++	q->avail[1] = q->avail_idx;
++}
++
++static inline void
++svio_notify(struct svio_dev *d, struct svio_queue *q)
++{
++	svio_mb();
++	svio_wr(d, SVIO_REG_QUEUE_NOTIFY, q->index);
++}
++
++/* One completed chain, if any. Returns true and its head id/len. */
++static inline bool
++svio_pop(struct svio_queue *q, uint32_t *id, uint32_t *len)
++{
++	svio_mb();
++	if (q->used[1] == q->last_used) {
++		return false;
++	}
++	volatile struct svio_used_elem *ring =
++	    (volatile struct svio_used_elem *)(q->used + 2);
++	uint16_t slot = q->last_used % q->num;
++	*id = ring[slot].id;
++	*len = ring[slot].len;
++	q->last_used++;
++	return true;
++}
++
++/* Acknowledge interrupts (polled drivers still clear the status). */
++static inline void
++svio_ack(struct svio_dev *d)
++{
++	uint32_t st = svio_rd(d, SVIO_REG_INT_STATUS);
++	if (st) {
++		svio_wr(d, SVIO_REG_INT_ACK, st);
++	}
++}
++
++/* ---- virtio-blk ---- */
++
++#define SVIO_BLK_F_RO           (1u << 5)
++#define SVIO_BLK_F_FLUSH        (1u << 9)
++
++#define SVIO_BLK_T_IN           0u
++#define SVIO_BLK_T_OUT          1u
++#define SVIO_BLK_T_FLUSH        4u
++
++#define SVIO_BLK_S_OK           0u
++
++struct svio_blk_hdr {
++	uint32_t type;
++	uint32_t reserved;
++	uint64_t sector;
++};
++
++/*
++ * Request memory: header (16 bytes) at hdr/hdr_pa, status byte right after
++ * it. Data at data_pa (may be 0 bytes for FLUSH). The caller polls
++ * svio_blk_done().
++ */
++static inline void
++svio_blk_start(struct svio_dev *d, struct svio_queue *q,
++    struct svio_blk_hdr *hdr, uint64_t hdr_pa, uint32_t type,
++    uint64_t sector, uint64_t data_pa, uint32_t len)
++{
++	volatile uint8_t *status = (volatile uint8_t *)(hdr + 1);
++
++	hdr->type = type;
++	hdr->reserved = 0;
++	hdr->sector = sector;
++	*status = 0xff;
++	if (len) {
++		svio_desc_set(q, 0, hdr_pa, sizeof(*hdr), SVIO_DESC_NEXT, 1);
++		svio_desc_set(q, 1, data_pa, len,
++		    (uint16_t)(SVIO_DESC_NEXT | (type == SVIO_BLK_T_IN ? SVIO_DESC_WRITE : 0)), 2);
++		svio_desc_set(q, 2, hdr_pa + sizeof(*hdr), 1, SVIO_DESC_WRITE, 0);
++	} else {
++		svio_desc_set(q, 0, hdr_pa, sizeof(*hdr), SVIO_DESC_NEXT, 1);
++		svio_desc_set(q, 1, hdr_pa + sizeof(*hdr), 1, SVIO_DESC_WRITE, 0);
++	}
++	svio_push(q, 0);
++	svio_notify(d, q);
++}
++
++/* -1 still running, otherwise the virtio-blk status (0 = OK). */
++static inline int
++svio_blk_done(struct svio_dev *d, struct svio_queue *q, struct svio_blk_hdr *hdr)
++{
++	uint32_t id, len;
++	if (!svio_pop(q, &id, &len)) {
++		return -1;
++	}
++	svio_ack(d);
++	return *(volatile uint8_t *)(hdr + 1);
++}
++
++/* ---- virtio-input ---- */
++
++#define SVIO_INPUT_CFG_ID_NAME  0x01
++#define SVIO_INPUT_CFG_EV_BITS  0x11
++#define SVIO_INPUT_CFG_ABS_INFO 0x12
++
++#define SVIO_EV_SYN             0x00
++#define SVIO_EV_KEY             0x01
++#define SVIO_EV_ABS             0x03
++
++#define SVIO_ABS_X              0x00
++#define SVIO_ABS_Y              0x01
++#define SVIO_ABS_MT_SLOT        0x2f
++#define SVIO_ABS_MT_POSITION_X  0x35
++#define SVIO_ABS_MT_POSITION_Y  0x36
++#define SVIO_ABS_MT_TRACKING_ID 0x39
++
++#define SVIO_BTN_LEFT           0x110
++#define SVIO_BTN_TOUCH          0x14a
++
++struct svio_input_event {
++	uint16_t type;
++	uint16_t code;
++	uint32_t value;
++};
++
++/* Select a config item; returns its size (0 = not supported). */
++static inline uint8_t
++svio_input_select(struct svio_dev *d, uint8_t select, uint8_t subsel)
++{
++	svio_cfg8_wr(d, 0, select);
++	svio_cfg8_wr(d, 1, subsel);
++	return svio_cfg8(d, 2);
++}
++
++/* Device name (NUL-terminated, truncated to cap). */
++static inline void
++svio_input_name(struct svio_dev *d, char *out, unsigned cap)
++{
++	uint8_t n = svio_input_select(d, SVIO_INPUT_CFG_ID_NAME, 0);
++	unsigned i;
++	for (i = 0; i < n && i + 1 < cap; i++) {
++		out[i] = (char)svio_cfg8(d, 8 + i);
++	}
++	if (cap) {
++		out[i] = 0;
++	}
++}
++
++/* Range of an absolute axis. Returns false if the device lacks it. */
++static inline bool
++svio_input_abs(struct svio_dev *d, uint8_t axis, int32_t *min, int32_t *max)
++{
++	if (svio_input_select(d, SVIO_INPUT_CFG_ABS_INFO, axis) < 8) {
++		return false;
++	}
++	uint32_t lo = 0, hi = 0;
++	for (unsigned i = 0; i < 4; i++) {
++		lo |= (uint32_t)svio_cfg8(d, 8 + i) << (8 * i);
++		hi |= (uint32_t)svio_cfg8(d, 12 + i) << (8 * i);
++	}
++	*min = (int32_t)lo;
++	*max = (int32_t)hi;
++	return true;
++}
++
++/*
++ * Event buffers: n entries of struct svio_input_event at ev/ev_pa,
++ * descriptor i <-> buffer i. Post all of them once after setup.
++ */
++static inline void
++svio_input_post(struct svio_queue *q, uint64_t ev_pa, uint16_t i)
++{
++	svio_desc_set(q, i, ev_pa + (uint64_t)i * sizeof(struct svio_input_event),
++	    sizeof(struct svio_input_event), SVIO_DESC_WRITE, 0);
++	svio_push(q, i);
++}
++
++/*
++ * Touch state machine shared by the kernel and the self-test. Turns a
++ * stream of evdev events (single-pointer tablet with BTN_LEFT/BTN_TOUCH,
++ * or type-B multitouch slots) into per-finger reports on EV_SYN.
++ */
++#define SVIO_TOUCH_SLOTS        10
++
++struct svio_touch {
++	int32_t xmin, xmax, ymin, ymax;         /* ABS_X/Y or MT ranges */
++	bool mt;
++	int slot;
++	bool down[SVIO_TOUCH_SLOTS], sent_down[SVIO_TOUCH_SLOTS];
++	int32_t x[SVIO_TOUCH_SLOTS], y[SVIO_TOUCH_SLOTS];
++	bool dirty[SVIO_TOUCH_SLOTS];
++};
++
++typedef void (*svio_touch_cb)(int finger, int down, int x, int y);
++typedef void (*svio_key_cb)(uint16_t code, int down);
++
++static inline int
++svio_scale(int32_t v, int32_t min, int32_t max, int out)
++{
++	if (max <= min) {
++		return 0;
++	}
++	if (v < min) {
++		v = min;
++	}
++	if (v > max) {
++		v = max;
++	}
++	return (int)(((int64_t)(v - min) * out) / ((int64_t)max - min + 1));
++}
++
++/* Feed one event. Panel size w x h pixels. */
++static inline void
++svio_touch_event(struct svio_touch *t, const struct svio_input_event *e,
++    int w, int h, svio_touch_cb touch, svio_key_cb key)
++{
++	int s = t->slot;
++
++	switch (e->type) {
++	case SVIO_EV_ABS:
++		switch (e->code) {
++		case SVIO_ABS_MT_SLOT:
++			if ((int32_t)e->value >= 0 && (int32_t)e->value < SVIO_TOUCH_SLOTS) {
++				t->slot = (int)e->value;
++			}
++			break;
++		case SVIO_ABS_MT_TRACKING_ID:
++			t->down[s] = (int32_t)e->value >= 0;
++			t->dirty[s] = true;
++			break;
++		case SVIO_ABS_MT_POSITION_X:
++			t->x[s] = (int32_t)e->value;
++			t->dirty[s] = true;
++			break;
++		case SVIO_ABS_MT_POSITION_Y:
++			t->y[s] = (int32_t)e->value;
++			t->dirty[s] = true;
++			break;
++		case SVIO_ABS_X:
++			if (!t->mt) {
++				t->x[0] = (int32_t)e->value;
++				t->dirty[0] = true;
++			}
++			break;
++		case SVIO_ABS_Y:
++			if (!t->mt) {
++				t->y[0] = (int32_t)e->value;
++				t->dirty[0] = true;
++			}
++			break;
++		}
++		break;
++	case SVIO_EV_KEY:
++		if (e->code == SVIO_BTN_LEFT || e->code == SVIO_BTN_TOUCH) {
++			if (!t->mt) {
++				t->down[0] = e->value != 0;
++				t->dirty[0] = true;
++			}
++		} else if (key && e->value != 2) {      /* ignore autorepeat */
++			key(e->code, e->value != 0);
++		}
++		break;
++	case SVIO_EV_SYN:
++		for (int i = 0; i < SVIO_TOUCH_SLOTS; i++) {
++			if (!t->dirty[i]) {
++				continue;
++			}
++			t->dirty[i] = false;
++			/* A tablet that moves with no button held is hover: not a touch. */
++			if (!t->down[i] && !t->sent_down[i]) {
++				continue;
++			}
++			t->sent_down[i] = t->down[i];
++			if (touch) {
++				touch(i, t->down[i],
++				    svio_scale(t->x[i], t->xmin, t->xmax, w),
++				    svio_scale(t->y[i], t->ymin, t->ymax, h));
++			}
++		}
++		break;
++	}
++}
++
++#endif /* SWEET_VIRTIO_CORE_H */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..3d33971 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++//
++//	SWEET on QEMU virt: root on the first virtio-blk disk (bsd/dev/sweet_virtio.c)
++//
++	if (strcmp(rdBootVar, "vblk0") == 0) {
++		extern int sweet_virtio_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int vblk_error = sweet_virtio_rootdev(root);
++		if (vblk_error) {
++			panic("IOFindBSDRoot: SWEET virtio root %s unavailable: %d", rdBootVar, vblk_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..90eebc8 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -17,6 +17,13 @@
+ 
+ #define SWEET                     1
+ 
++/*
++ * xnu's PL011 console (pe_serial.c), used only when the ADT has a "uart0"
++ * node: tools/mkadt.py --virt adds one for QEMU virt's UART at 0x09000000.
++ * The phone tree has none, so nothing changes there.
++ */
++#define VMAPPLE_UART              1
++
+ /*
+  * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
