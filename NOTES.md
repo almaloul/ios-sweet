@@ -2,6 +2,13 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23 (later): SweetEmu, standalone Windows app (app/) <<<
+
+- **What:** `app/` = .NET 8 solution. `SweetEmu.Core` does natively what mkiosroot.sh + sweet-root-tweaks.py + mkadt.py --virt + mkpayload.py + sweet-virt.py do (zip/Zip64, UDIF, APFS incl. sealed fext tree, decmpfs zlib/LZVN/LZFSE/LZBITMAP, HFSX journaled writer with Leopard hard links, plists, IM4P). `SweetEmu` = WinForms window (folder checklist, Prepare, Start/Stop, Home/Vol/Lock via QMP keys). `SweetEmu.Cli` = same engine on the command line. `.github/workflows/app.yml` = tests on Linux + Windows package (exe + kernel from latest successful xnu.yml + trimmed choco QEMU).
+- **Observed (Linux):** see app/README.md "Tests" (APFS listings identical to dissect.apfs; fsck_hfs clean incl. 250k-entry tree; ADT/payload/RAM layout byte-identical to the Python tools; synthetic IPSW Prepare -> fsck-clean image; UI exercised with Mono + fake backend).
+- **Not yet observed:** a real IPSW through Prepare; the WinForms build (no Windows Desktop SDK here; app.yml builds it); booting.
+- **Next:** run app.yml; on Windows: Prepare with the 20H392 IPSW, then compare the image against a mkiosroot.sh-built one (e.g. `SweetEmu.Cli apfs-dump`-style listing of both mounted HFS images) before booting.
+
 ### >>> UPDATE 2026-10-23: QEMU virt target (docs/VIRT.md) <<<
 
 Separate track from the phone work below; nothing here changes the phone boot.

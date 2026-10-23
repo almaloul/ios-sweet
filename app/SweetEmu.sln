@@ -1,0 +1,40 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SweetEmu.Tests", "SweetEmu.Tests\SweetEmu.Tests.csproj", "{E63162E1-9B86-487E-BD91-ADB4145998DA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SweetEmu.Core", "SweetEmu.Core\SweetEmu.Core.csproj", "{D1EA23BD-0AB8-44B4-8B3B-9DF6BC9883A1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SweetEmu.Cli", "SweetEmu.Cli\SweetEmu.Cli.csproj", "{14B9C00B-423D-4DE1-83C3-BACC909BEF9F}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SweetEmu", "SweetEmu\SweetEmu.csproj", "{5A1C1E3E-3F4B-4D2E-9B1A-7E2F0C9D4A11}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5A1C1E3E-3F4B-4D2E-9B1A-7E2F0C9D4A11}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5A1C1E3E-3F4B-4D2E-9B1A-7E2F0C9D4A11}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5A1C1E3E-3F4B-4D2E-9B1A-7E2F0C9D4A11}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5A1C1E3E-3F4B-4D2E-9B1A-7E2F0C9D4A11}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E63162E1-9B86-487E-BD91-ADB4145998DA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E63162E1-9B86-487E-BD91-ADB4145998DA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E63162E1-9B86-487E-BD91-ADB4145998DA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E63162E1-9B86-487E-BD91-ADB4145998DA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D1EA23BD-0AB8-44B4-8B3B-9DF6BC9883A1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D1EA23BD-0AB8-44B4-8B3B-9DF6BC9883A1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D1EA23BD-0AB8-44B4-8B3B-9DF6BC9883A1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D1EA23BD-0AB8-44B4-8B3B-9DF6BC9883A1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{14B9C00B-423D-4DE1-83C3-BACC909BEF9F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{14B9C00B-423D-4DE1-83C3-BACC909BEF9F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{14B9C00B-423D-4DE1-83C3-BACC909BEF9F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{14B9C00B-423D-4DE1-83C3-BACC909BEF9F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

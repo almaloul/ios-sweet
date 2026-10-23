@@ -12,6 +12,14 @@ iPhone X userland on top.
 > real QEMU devices (see "Tests" below). Expect the first CI build or the
 > first boot to need fixes.
 
+## Easiest on Windows: the SweetEmu app
+
+[`app/`](../app/README.md) is a standalone Windows app that does all of the
+steps below natively (no WSL, Python or Linux tools): unzip the
+`SweetEmu-win-x64` artifact from the `app` workflow, put the IPSW in its
+`IPSW` folder, click **Prepare**, then **Start**. The rest of this page is the
+manual route and how it works underneath.
+
 ## How it works
 
 | Phone (`sweet`)                         | QEMU `virt`                                                                 |

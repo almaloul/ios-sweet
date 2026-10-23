@@ -1,0 +1,14 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pre-kernel stub that points QEMU ramfb at the framebuffer (tools/virt/stub). -->
+    <EmbeddedResource Include="..\..\tools\virt\stub\ramfb_stub.bin" LogicalName="SweetEmu.Core.ramfb_stub.bin" />
+  </ItemGroup>
+
+</Project>

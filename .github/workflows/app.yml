@@ -1,0 +1,88 @@
+name: app
+
+# Builds SweetEmu, the Windows app, and packages it with everything it needs
+# except the IPSW: the SWEET kernel from the latest successful xnu.yml run and
+# a trimmed QEMU. Download the "SweetEmu-win-x64" artifact, unzip, put the
+# iPhone X iOS 16.7.16 IPSW in the IPSW folder, run SweetEmu.exe.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "tools/virt/stub/**"
+      - ".github/workflows/app.yml"
+  workflow_run:
+    workflows: [xnu]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Tools for the filesystem tests
+        run: sudo apt-get update -q && sudo apt-get install -y -q hfsprogs
+      - name: Core tests
+        run: dotnet run --project app/SweetEmu.Tests -c Release
+
+  package:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish SweetEmu.exe (self-contained, single file)
+        run: dotnet publish app/SweetEmu/SweetEmu.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o pkg
+
+      - name: Folders and read-me files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg/IPSW, pkg/Kernel | Out-Null
+          Copy-Item app/package/README.txt pkg/README.txt
+          Copy-Item app/package/IPSW-README.txt pkg/IPSW/README.txt
+          Copy-Item app/package/Kernel-README.txt pkg/Kernel/README.txt
+          Remove-Item pkg/*.pdb -ErrorAction SilentlyContinue
+
+      - name: Kernel from the latest successful xnu build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $run = gh run list -R "${{ github.repository }}" --workflow xnu.yml --status success --limit 1 --json databaseId -q '.[0].databaseId'
+          if (-not $run) {
+            Write-Host "::warning::No successful xnu.yml run yet: the package has no kernel. Run the xnu workflow, then this one."
+            exit 0
+          }
+          gh run download $run -R "${{ github.repository }}" -n xnu-kernel -D kernel-dl
+          Get-ChildItem kernel-dl
+          Copy-Item kernel-dl/kernel.development.sweet pkg/Kernel/ -ErrorAction Stop
+          "xnu.yml run $run" | Out-File pkg/Kernel/SOURCE.txt
+
+      - name: QEMU (only what qemu-system-aarch64 needs)
+        shell: pwsh
+        run: |
+          choco install qemu -y --no-progress
+          $q = "C:\Program Files\qemu"
+          New-Item -ItemType Directory -Force pkg/qemu | Out-Null
+          Copy-Item "$q\qemu-system-aarch64.exe", "$q\qemu-img.exe", "$q\*.dll" pkg/qemu/
+          foreach ($d in "share", "lib") { if (Test-Path "$q\$d") { Copy-Item "$q\$d" pkg/qemu/ -Recurse } }
+          foreach ($f in "COPYING", "COPYING.LIB", "LICENSE") { if (Test-Path "$q\$f") { Copy-Item "$q\$f" pkg/qemu/ } }
+          & pkg/qemu/qemu-system-aarch64.exe --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweetEmu-win-x64
+          path: pkg/
+          retention-days: 30

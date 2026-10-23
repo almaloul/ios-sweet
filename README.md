@@ -144,7 +144,7 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 
 ### Full iOS on QEMU (Windows, Linux, macOS)
 
-`tools/sweet-virt.py` boots the whole iOS 16 userland on QEMU `virt` in a window: the framebuffer through ramfb, the root image on virtio-blk, the mouse as the touchscreen. Kernel support is patch 0082 and `tools/mkadt.py --virt`. Work in progress; see [`docs/VIRT.md`](docs/VIRT.md).
+`tools/sweet-virt.py` boots the whole iOS 16 userland on QEMU `virt` in a window: the framebuffer through ramfb, the root image on virtio-blk, the mouse as the touchscreen. Kernel support is patch 0082 and `tools/mkadt.py --virt`. Work in progress; see [`docs/VIRT.md`](docs/VIRT.md). On Windows, [`app/`](app/README.md) (SweetEmu) wraps all of it in one app: drop the IPSW in a folder and click Prepare, then Start.
 
 ## Repository layout
 

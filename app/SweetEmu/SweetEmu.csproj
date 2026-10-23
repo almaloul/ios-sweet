@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- SweetEmu: the Windows app. Build on Windows with Visual Studio 2022 or the .NET 8 SDK
+       (see app/README.md), or let .github/workflows/app.yml build the complete package. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>SweetEmu</AssemblyName>
+    <RootNamespace>SweetEmu</RootNamespace>
+    <ApplicationIcon>SweetEmu.ico</ApplicationIcon>
+    <Version>0.1.0</Version>
+    <Product>SweetEmu</Product>
+    <Description>iOS 16 (ios-sweet XNU port) on QEMU</Description>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Linux-only UI preview (Mono + fake backend) -->
+    <Compile Remove="Preview/**" />
+    <None Include="Preview/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SweetEmu.Core\SweetEmu.Core.csproj" />
+  </ItemGroup>
+
+</Project>
