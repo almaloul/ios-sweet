@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_virtio.c b/bsd/dev/sweet_virtio.c
+index 341fde0..7dbd1e1 100644
+--- a/bsd/dev/sweet_virtio.c
++++ b/bsd/dev/sweet_virtio.c
+@@ -52,6 +52,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern void sweet_hid_key(int key, int down);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_sample_start(void);  /* bsd/dev/sweet_sample.c (the UFS path starts it on the phone) */
+ 
+ #define VBLK_SECTOR             512u
+ #define VBLK_PHYS_BLOCK         4096u
+@@ -432,6 +433,8 @@ sweet_vblk_init(void)
+ 	    vb.flush ? ", flush" : "", vb.dma_pa);
+ 
+ 	sweet_vinput_start();
++	/* "SMP ..." user-stack samples of SpringBoard/backboardd (boot-arg sweetsample). */
++	sweet_sample_start();
+ 	return 0;
+ }
+ 

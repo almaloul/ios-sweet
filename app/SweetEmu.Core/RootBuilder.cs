@@ -235,6 +235,9 @@ public static class RootBuilder
     {
         "profiled", "aggregated", "backupd", "donotdisturbd", "passd", "coreidvd",
         "sharingd", "callservicesd", "assistantd",
+        // No crash, but they exit at once (no Bluetooth hardware, no FairPlay
+        // keys) and launchd starts them again every ~10 s: ~280 times per hour.
+        "bluetoothd", "fairplayd.H2",
     };
 
     public static void EmulatorTweaks(FsTree tree, Action<string> log)
