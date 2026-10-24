@@ -132,6 +132,7 @@ public static class RootBuilder
                 "<plist version=\"1.0\"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>\n"), 0x180, 0, 0));
 
             ApplyTweaks(tree, build, version, Log);
+            EmulatorTweaks(tree, Log);
 
             // Size and write.
             long dataBytes = 0;
@@ -225,6 +226,38 @@ public static class RootBuilder
             cur = d;
         }
         return cur;
+    }
+
+    /// Daemons that only crash-loop under QEMU (observed 2026-10-23: each one
+    /// restarted ~100 times in 20 minutes). On one emulated CPU every restart
+    /// takes time away from SpringBoard, so the emulator image does not run them.
+    public static readonly string[] EmulatorDisabledDaemons =
+    {
+        "profiled", "aggregated", "backupd", "donotdisturbd", "passd", "coreidvd",
+        "sharingd", "callservicesd", "assistantd",
+    };
+
+    public static void EmulatorTweaks(FsTree tree, Action<string> log)
+    {
+        var launchd = tree.Get("System/Library/xpc/launchd.plist");
+        if (launchd?.Kind != NodeKind.File) return;
+        var plist = (PDict)Plist.Read(launchd.ReadAll());
+        if (plist.Dict("LaunchDaemons") is not { } jobs) return;
+        var removed = new List<string>();
+        foreach (var k in jobs.Keys.ToList())
+        {
+            if (jobs[k] is not PDict job) continue;
+            string? program = job.Str("Program") ?? job.Array("ProgramArguments")?.FirstOrDefault() as string;
+            if (program == null) continue;
+            string name = program[(program.LastIndexOf('/') + 1)..];
+            if (Array.IndexOf(EmulatorDisabledDaemons, name) >= 0)
+            {
+                jobs.Remove(k);
+                removed.Add(name);
+            }
+        }
+        launchd.SetContent(Plist.Write(plist, PlistFormat.Binary));
+        log($"launchd.plist (emulator): {removed.Count} crash-looping jobs removed ({string.Join(", ", removed.Distinct())})");
     }
 
     // ---------------- tools/sweet-root-tweaks.py ----------------

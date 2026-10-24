@@ -114,4 +114,30 @@ public static class RootTweakTests
             Assert.Equal(string.Join(",", d.Keys), string.Join(",", back.Keys), $"{fmt} key order");
         }
     }
+
+    [Test]
+    public static void EmulatorTweaksRemoveCrashLoopingDaemons()
+    {
+        PDict Job(string label, string? program, params string[] args)
+        {
+            var j = new PDict { { "Label", label } };
+            if (program != null) j["Program"] = program;
+            if (args.Length > 0) j["ProgramArguments"] = args.Cast<object>().ToList();
+            return j;
+        }
+        var jobs = new PDict
+        {
+            { "/System/Library/LaunchDaemons/com.apple.profiled.plist", Job("com.apple.managedconfiguration.profiled", "/System/Library/PrivateFrameworks/ManagedConfiguration.framework/Support/profiled") },
+            { "/System/Library/LaunchDaemons/com.apple.backupd.plist", Job("com.apple.backupd", null, "/System/Library/PrivateFrameworks/MobileBackup.framework/backupd", "-x") },
+            { "/System/Library/LaunchDaemons/com.apple.SpringBoard.plist", Job("com.apple.SpringBoard", "/System/Library/CoreServices/SpringBoard.app/SpringBoard") },
+        };
+        var tree = new FsTree(FsInode.NewDir(0x1ED, 0, 0));
+        tree.MkdirP("System/Library/xpc", 0x1ED, 0, 0);
+        tree.Put("System/Library/xpc/launchd.plist", FsInode.NewFile(Plist.Write(new PDict { { "LaunchDaemons", jobs } }, PlistFormat.Binary), 0x1A4, 0, 0));
+        string? msg = null;
+        RootBuilder.EmulatorTweaks(tree, m => msg = m);
+        var left = ((PDict)Plist.Read(tree.Get("System/Library/xpc/launchd.plist")!.ReadAll())).Dict("LaunchDaemons")!;
+        if (left.Count != 1 || left.Keys.Single() != "/System/Library/LaunchDaemons/com.apple.SpringBoard.plist")
+            throw new Exception("wrong jobs left: " + string.Join(", ", left.Keys) + " / " + msg);
+    }
 }
