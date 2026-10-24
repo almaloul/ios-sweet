@@ -108,6 +108,7 @@ public static partial class Commands
           ipsw-info IPSW                   what the app would use from an IPSW
           prepare HOME                     build Data/ios16-root.img from HOME/IPSW/*.ipsw
           run HOME [--headless] [--secs N] [--screenshot F] [--discard]   boot it in QEMU
+          symbolicate HOME [LOG] [OUT]     name the addresses in SMP/CRASH lines of serial.txt
         """;
 
     public static int Run(string[] args)
@@ -207,6 +208,25 @@ public static partial class Commands
                 Console.WriteLine($"iOS {ipsw.ProductVersion} ({ipsw.BuildVersion}) for {string.Join(", ", ipsw.SupportedProductTypes)}");
                 foreach (var c in new[] { "OS", "Cryptex1,SystemOS", "Cryptex1,AppOS", "DeviceTree" })
                     Console.WriteLine($"  {c}: {ipsw.ComponentPath(c)}");
+                return 0;
+            }
+            case "symbolicate":
+            {
+                var emu = new SweetEmu.Core.Emulator(args[1]);
+                string logPath = args.Length > 2 ? args[2] : Path.Combine(emu.RunDir, "serial.txt");
+                string outPath = args.Length > 3 ? args[3] : Path.ChangeExtension(logPath, ".symbolicated.txt");
+                using var ipsw = new SweetEmu.Core.Ipsw(emu.FindIpsw() ?? throw new FileNotFoundException("no IPSW in " + emu.IpswDir));
+                var keep = new List<IDisposable>();
+                try
+                {
+                    using var cache = SweetEmu.Core.Debug.LogSymbolicator.OpenFromIpsw(ipsw, emu.TempDir, Console.WriteLine, keep);
+                    File.WriteAllText(outPath, SweetEmu.Core.Debug.LogSymbolicator.Annotate(File.ReadLines(logPath), cache));
+                    Console.WriteLine($"wrote {outPath}");
+                }
+                finally
+                {
+                    for (int i = keep.Count - 1; i >= 0; i--) keep[i].Dispose();
+                }
                 return 0;
             }
             case "prepare":
