@@ -13,13 +13,17 @@ namespace SweetEmu.Core.Debug;
 
 public sealed class DyldCache : IDisposable
 {
-    sealed record Mapping(ulong Address, ulong Size, ulong FileOffset, Stream File);
+    sealed record Mapping(ulong Address, ulong Size, ulong FileOffset, Stream File, string FileName, uint MaxProt, uint InitProt);
 
     sealed class Image
     {
         public ulong Address;
         public string Path = "";
         public ulong TextSize;              // 0 = not parsed yet
+        public List<(string Name, ulong Vm, ulong Size)> Segments = new();
+        public bool HeaderParsed;
+        public ulong LeVm, LeFile;
+        public uint SymOff, NSyms, StrOff, StrSize;
         public List<(ulong Addr, string Name)>? Symbols;
         public string Name => Path[(Path.LastIndexOf('/') + 1)..];
     }
@@ -40,7 +44,7 @@ public sealed class DyldCache : IDisposable
         var hdr = ReadAt(main, 0, 0x200);
         if (!Encoding.ASCII.GetString(hdr, 0, 7).StartsWith("dyld_v1")) throw new InvalidDataException("not a dyld shared cache");
         uint mappingOffset = U32(hdr, 0x10);
-        AddFile(main, hdr);
+        AddFile(main, hdr, mainName);
         BaseAddress = mappings[0].Address;
 
         // Image list (new location when the header is long enough).
@@ -63,7 +67,7 @@ public sealed class DyldCache : IDisposable
             {
                 var s = open(mainName + suffix);
                 if (s == null) continue;
-                AddFile(s, ReadAt(s, 0, 0x200));
+                AddFile(s, ReadAt(s, 0, 0x200), mainName + suffix);
                 any = true;
             }
             if (!any && i > 1) break;
@@ -81,13 +85,13 @@ public sealed class DyldCache : IDisposable
         }
     }
 
-    void AddFile(Stream s, byte[] hdr)
+    void AddFile(Stream s, byte[] hdr, string name)
     {
         files.Add(s);
         uint off = U32(hdr, 0x10), count = U32(hdr, 0x14);
         var m = ReadAt(s, off, (int)count * 32);
         for (int i = 0; i < count; i++)
-            mappings.Add(new Mapping(U64(m, i * 32), U64(m, i * 32 + 8), U64(m, i * 32 + 16), s));
+            mappings.Add(new Mapping(U64(m, i * 32), U64(m, i * 32 + 8), U64(m, i * 32 + 16), s, name, U32(m, i * 32 + 24), U32(m, i * 32 + 28)));
     }
 
     void LoadLocals(Stream sym, ulong lsOff, bool entries64)
@@ -144,18 +148,15 @@ public sealed class DyldCache : IDisposable
         return addr < img.Address + img.TextSize ? img : null;
     }
 
-    void Parse(Image img)
+    void ParseHeader(Image img)
     {
-        if (img.Symbols != null) return;
-        img.Symbols = new List<(ulong, string)>();
-        if (locals.TryGetValue(img.Address, out var l)) AddNlists(img.Symbols, localNl, localStrs, l.Start, l.Count);
+        if (img.HeaderParsed) return;
+        img.HeaderParsed = true;
         var mh = ReadVm(img.Address, 32);
         if (mh == null || U32(mh, 0) != 0xfeedfacf) { img.TextSize = 0x1000; return; }
         uint ncmds = U32(mh, 16), sizeofcmds = U32(mh, 20);
         var cmds = ReadVm(img.Address + 32, (int)sizeofcmds);
         if (cmds == null) return;
-        ulong leVm = 0, leFile = 0;
-        uint symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
         int o = 0;
         for (int i = 0; i < ncmds && o + 8 <= cmds.Length; i++)
         {
@@ -164,20 +165,29 @@ public sealed class DyldCache : IDisposable
             {
                 string seg = CStr(cmds, o + 8, 16);
                 if (seg == "__TEXT") img.TextSize = U64(cmds, o + 32);
-                if (seg == "__LINKEDIT") { leVm = U64(cmds, o + 24); leFile = U64(cmds, o + 40); }
+                img.Segments.Add((seg, U64(cmds, o + 24), U64(cmds, o + 32)));
+                if (seg == "__LINKEDIT") { img.LeVm = U64(cmds, o + 24); img.LeFile = U64(cmds, o + 40); }
             }
             else if (cmd == 0x2) // LC_SYMTAB
             {
-                symoff = U32(cmds, o + 8); nsyms = U32(cmds, o + 12); stroff = U32(cmds, o + 16); strsize = U32(cmds, o + 20);
+                img.SymOff = U32(cmds, o + 8); img.NSyms = U32(cmds, o + 12); img.StrOff = U32(cmds, o + 16); img.StrSize = U32(cmds, o + 20);
             }
             if (size == 0) break;
             o += (int)size;
         }
-        if (nsyms > 0 && leVm != 0 && nsyms < 5_000_000)
+    }
+
+    void Parse(Image img)
+    {
+        if (img.Symbols != null) return;
+        ParseHeader(img);
+        img.Symbols = new List<(ulong, string)>();
+        if (locals.TryGetValue(img.Address, out var l)) AddNlists(img.Symbols, localNl, localStrs, l.Start, l.Count);
+        if (img.NSyms > 0 && img.LeVm != 0 && img.NSyms < 5_000_000)
         {
-            var nl = ReadVm(leVm + symoff - leFile, (int)nsyms * 16);
-            var strs = ReadVm(leVm + stroff - leFile, (int)strsize);
-            if (nl != null && strs != null) AddNlists(img.Symbols, nl, strs, 0, nsyms);
+            var nl = ReadVm(img.LeVm + img.SymOff - img.LeFile, (int)img.NSyms * 16);
+            var strs = ReadVm(img.LeVm + img.StrOff - img.LeFile, (int)img.StrSize);
+            if (nl != null && strs != null) AddNlists(img.Symbols, nl, strs, 0, img.NSyms);
         }
         img.Symbols.Sort((a, b) => a.Addr.CompareTo(b.Addr));
     }
@@ -199,6 +209,53 @@ public sealed class DyldCache : IDisposable
         var (a, n) = syms[best];
         if (n.StartsWith('_')) n = n[1..];
         return $"{img.Name}`{n} + 0x{addr - a:x}";
+    }
+
+    static string Prot(uint p) => $"{((p & 1) != 0 ? 'r' : '-')}{((p & 2) != 0 ? 'w' : '-')}{((p & 4) != 0 ? 'x' : '-')}";
+
+    /// Everything known about an unslid address: which cache file/mapping (and its
+    /// protections), which image and segment, the nearest symbol in any segment,
+    /// and the first instruction words there.
+    public string Describe(ulong addr)
+    {
+        var sb = new StringBuilder($"0x{addr:x}:\n");
+        var m = mappings.FirstOrDefault(x => addr >= x.Address && addr < x.Address + x.Size);
+        sb.AppendLine(m == null ? "  not in any cache mapping"
+            : $"  mapping {m.FileName} 0x{m.Address:x}-0x{m.Address + m.Size:x} init {Prot(m.InitProt)} max {Prot(m.MaxProt)}");
+        foreach (var img in images)
+        {
+            ParseHeader(img);
+            foreach (var seg in img.Segments)
+            {
+                if (addr < seg.Vm || addr >= seg.Vm + seg.Size || seg.Name == "__LINKEDIT") continue;
+                Parse(img);
+                sb.AppendLine($"  image {img.Path} segment {seg.Name} + 0x{addr - seg.Vm:x}");
+                var near = img.Symbols!.Where(x => x.Addr <= addr).Select(x => (x.Addr, x.Name)).DefaultIfEmpty((0UL, "")).MaxBy(x => x.Item1);
+                if (near.Item1 != 0) sb.AppendLine($"  nearest symbol {near.Item2} + 0x{addr - near.Item1:x}");
+            }
+        }
+        var words = ReadVm(addr & ~3UL, 16);
+        if (words != null)
+            sb.AppendLine("  words " + string.Join(" ", Enumerable.Range(0, 4).Select(i => $"{U32(words, i * 4):x8}")));
+        return sb.ToString();
+    }
+
+    /// For a return address: the call instruction before it and, for a direct BL, its target.
+    public string DescribeCallBefore(ulong lr)
+    {
+        var w = ReadVm(lr - 4, 4);
+        if (w == null) return $"0x{lr:x}: not mapped";
+        uint insn = U32(w, 0);
+        var sb = new StringBuilder($"call before 0x{lr:x}: {insn:x8}");
+        if ((insn & 0xFC000000) == 0x94000000) // BL imm26
+        {
+            long imm = ((long)(insn & 0x03FFFFFF) << 38) >> 36;
+            ulong target = (ulong)((long)(lr - 4) + imm);
+            sb.Append($" = BL 0x{target:x}\n").Append(Describe(target));
+        }
+        else if ((insn & 0xFFFFFC1F) == 0xD63F0000) sb.Append($" = BLR x{(insn >> 5) & 31}\n");
+        else sb.Append('\n');
+        return sb.ToString();
     }
 
     public void Dispose()

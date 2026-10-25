@@ -45,6 +45,7 @@ public static class DyldCacheTests
         Nlist(main, 0x8010, 11, Base + 0x1800);
         Str(main, 0x8101, "_exported");
         Str(main, 0x810b, "_other");
+        W32(main, 0x1200, 0x94000000u | (0x03FFFFFFu - 0x3F)); // BL _exported
 
         var sym = new byte[0x1000];
         Str(sym, 0, "dyld_v1   arm64");
@@ -74,6 +75,10 @@ public static class DyldCacheTests
         Expect(0x180001450, "libtest.dylib`local_fn + 0x50");
         Expect(0x180001810, "libtest.dylib`other + 0x10");
         Expect(0x180004000, null); // past __TEXT
+
+        string d = cache.DescribeCallBefore(0x180001204);
+        foreach (var want in new[] { "BL 0x180001100", "mapping dyld_shared_cache_arm64 0x180000000-0x180010000", "segment __TEXT + 0x100", "nearest symbol _exported + 0x0" })
+            if (!d.Contains(want)) throw new Exception("describe missing: " + want + "\n" + d);
 
         string log = "SMP SpringBoard[26] slide 0x1000 mh 0x100ffc000\n" +
                      "SMP SpringBoard t0 pc 0x180002450 lr 0x100ffd010 sp 0x16edfd960 bt 0x180002104SMP backboardd[9] slide 0x0 mh 0x104000000\n";

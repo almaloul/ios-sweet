@@ -109,6 +109,7 @@ public static partial class Commands
           prepare HOME                     build Data/ios16-root.img from HOME/IPSW/*.ipsw
           run HOME [--headless] [--secs N] [--screenshot F] [--discard]   boot it in QEMU
           symbolicate HOME [LOG] [OUT]     name the addresses in SMP/CRASH lines of serial.txt
+          cache-addr HOME ADDR|call:LR...  describe unslid shared-cache addresses (call: = the call before a return address)
         """;
 
     public static int Run(string[] args)
@@ -222,6 +223,27 @@ public static partial class Commands
                     using var cache = SweetEmu.Core.Debug.LogSymbolicator.OpenFromIpsw(ipsw, emu.TempDir, Console.WriteLine, keep);
                     File.WriteAllText(outPath, SweetEmu.Core.Debug.LogSymbolicator.Annotate(File.ReadLines(logPath), cache));
                     Console.WriteLine($"wrote {outPath}");
+                }
+                finally
+                {
+                    for (int i = keep.Count - 1; i >= 0; i--) keep[i].Dispose();
+                }
+                return 0;
+            }
+            case "cache-addr":
+            {
+                var emu = new SweetEmu.Core.Emulator(args[1]);
+                using var ipsw = new SweetEmu.Core.Ipsw(emu.FindIpsw() ?? throw new FileNotFoundException("no IPSW in " + emu.IpswDir));
+                var keep = new List<IDisposable>();
+                try
+                {
+                    using var cache = SweetEmu.Core.Debug.LogSymbolicator.OpenFromIpsw(ipsw, emu.TempDir, Console.WriteLine, keep);
+                    foreach (var a in args.Skip(2))
+                    {
+                        bool call = a.StartsWith("call:");
+                        ulong v = Convert.ToUInt64((call ? a[5..] : a).Replace("0x", ""), 16);
+                        Console.WriteLine(call ? cache.DescribeCallBefore(v) : cache.Describe(v));
+                    }
                 }
                 finally
                 {
