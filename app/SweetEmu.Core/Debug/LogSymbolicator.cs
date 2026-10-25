@@ -55,8 +55,8 @@ public static class LogSymbolicator
 
     static ulong Hex(string s) => ulong.Parse(s, NumberStyles.HexNumber);
 
-    /// The dyld shared cache from the IPSW's SystemOS cryptex.
-    public static DyldCache OpenFromIpsw(Ipsw ipsw, string tempDir, Action<string> log, List<IDisposable> keepOpen)
+    /// The files of System/Library/Caches/com.apple.dyld in the IPSW's SystemOS cryptex.
+    public static (List<string> Names, Func<string, Stream?> Open) OpenDscFiles(Ipsw ipsw, string tempDir, Action<string> log, List<IDisposable> keepOpen)
     {
         log($"reading SystemOS cryptex ({ipsw.SystemOsImage})");
         var src = ipsw.OpenDiskImage(ipsw.SystemOsImage, tempDir);
@@ -79,7 +79,14 @@ public static class LogSymbolicator
             var e = entries.FirstOrDefault(x => x.Name == name);
             return e != null && vol.Inodes.TryGetValue(e.FileId, out var n) && n.IsRegular ? vol.OpenFile(n) : null;
         }
-        var cache = new DyldCache(Open);
+        return (entries.Select(e => e.Name).OrderBy(n => n, StringComparer.Ordinal).ToList(), Open);
+    }
+
+    /// The dyld shared cache from the IPSW's SystemOS cryptex.
+    public static DyldCache OpenFromIpsw(Ipsw ipsw, string tempDir, Action<string> log, List<IDisposable> keepOpen)
+    {
+        var (_, open) = OpenDscFiles(ipsw, tempDir, log, keepOpen);
+        var cache = new DyldCache(open);
         log($"  shared cache: {cache.ImageCount} images");
         return cache;
     }

@@ -109,6 +109,7 @@ public static partial class Commands
           prepare HOME                     build Data/ios16-root.img from HOME/IPSW/*.ipsw
           run HOME [--headless] [--secs N] [--screenshot F] [--discard]   boot it in QEMU
           symbolicate HOME [LOG] [OUT]     name the addresses in SMP/CRASH lines of serial.txt
+          verify-dsc HOME [IMG]            compare the dyld cache files in the root image with the IPSW
           cache-addr HOME ADDR|call:LR|sym:IMAGE:SYMBOL...  describe unslid shared-cache addresses (call: = the call before a return address)
         """;
 
@@ -223,6 +224,65 @@ public static partial class Commands
                     using var cache = SweetEmu.Core.Debug.LogSymbolicator.OpenFromIpsw(ipsw, emu.TempDir, Console.WriteLine, keep);
                     File.WriteAllText(outPath, SweetEmu.Core.Debug.LogSymbolicator.Annotate(File.ReadLines(logPath), cache));
                     Console.WriteLine($"wrote {outPath}");
+                }
+                finally
+                {
+                    for (int i = keep.Count - 1; i >= 0; i--) keep[i].Dispose();
+                }
+                return 0;
+            }
+            case "verify-dsc":
+            {
+                var emu = new SweetEmu.Core.Emulator(args[1]);
+                string img = args.Length > 2 ? args[2] : emu.RootImage;
+                using var ipsw = new SweetEmu.Core.Ipsw(emu.FindIpsw() ?? throw new FileNotFoundException("no IPSW in " + emu.IpswDir));
+                var keep = new List<IDisposable>();
+                try
+                {
+                    var (names, open) = SweetEmu.Core.Debug.LogSymbolicator.OpenDscFiles(ipsw, emu.TempDir, Console.WriteLine, keep);
+                    Console.WriteLine($"reading {img}");
+                    using var hfs = new SweetEmu.Core.Hfs.HfsReader(new SweetEmu.Core.IO.FileSource(img));
+                    int bad = 0;
+                    foreach (var name in names)
+                    {
+                        string path = "System/Library/Caches/com.apple.dyld/" + name;
+                        var f = hfs.Find(path);
+                        using var s = open(name);
+                        if (s == null) continue;
+                        if (f == null) { Console.WriteLine($"  {name}: MISSING in the image"); bad++; continue; }
+                        if (f.Length != s.Length) Console.WriteLine($"  {name}: size {f.Length} in the image, {s.Length} in the IPSW");
+                        const int Chunk = 1 << 20;
+                        var a = new byte[Chunk];
+                        long pos = 0, firstDiff = -1, diffPages = 0;
+                        string sample = "";
+                        while (pos < s.Length)
+                        {
+                            int want = (int)Math.Min(Chunk, s.Length - pos), got = 0;
+                            while (got < want) { int n = s.Read(a, got, want - got); if (n <= 0) break; got += n; }
+                            var b = hfs.ReadFork(f, pos, want);
+                            for (int p = 0; p < want; p += 4096)
+                            {
+                                int len = Math.Min(4096, want - p);
+                                if (!a.AsSpan(p, len).SequenceEqual(b.AsSpan(p, len)))
+                                {
+                                    if (firstDiff < 0)
+                                    {
+                                        int k = 0;
+                                        while (a[p + k] == b[p + k]) k++;
+                                        firstDiff = pos + p + k;
+                                        long q = (firstDiff & ~7L) - pos;
+                                        if (q + 8 <= want)
+                                            sample = $" (ipsw 0x{BitConverter.ToUInt64(a, (int)q):x}, image 0x{BitConverter.ToUInt64(b, (int)q):x})";
+                                    }
+                                    diffPages++;
+                                }
+                            }
+                            pos += want;
+                        }
+                        if (firstDiff < 0) Console.WriteLine($"  {name}: OK ({s.Length} bytes)");
+                        else { Console.WriteLine($"  {name}: DIFFERENT, {diffPages} of {(s.Length + 4095) / 4096} 4K pages, first at file offset 0x{firstDiff:x}{sample}"); bad++; }
+                    }
+                    Console.WriteLine(bad == 0 ? "all dyld cache files match" : $"{bad} files differ");
                 }
                 finally
                 {

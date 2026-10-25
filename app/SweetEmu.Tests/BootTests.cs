@@ -27,3 +27,37 @@ public static class BootTests
         }
     }
 }
+
+public static class HfsReaderTests
+{
+    [Test]
+    public static void ReadsBackWhatHfsWriterWrote()
+    {
+        var tree = new SweetEmu.Core.Fs.FsTree(SweetEmu.Core.Fs.FsInode.NewDir(0x1ED, 0, 0));
+        tree.MkdirP("System/Library/Caches/com.apple.dyld", 0x1ED, 0, 0);
+        tree.MkdirP("private/preboot/Cryptexes/OS", 0x1ED, 0, 0);
+        var data = new byte[5_000_000];
+        new Random(7).NextBytes(data);
+        var f = SweetEmu.Core.Fs.FsInode.NewFile(data, 0x1A4, 0, 0);
+        tree.Put("private/preboot/Cryptexes/OS/dsc", f);
+        tree.Put("System/Library/Caches/com.apple.dyld/dsc", f); // hard link
+        tree.Put("small", SweetEmu.Core.Fs.FsInode.NewFile(System.Text.Encoding.ASCII.GetBytes("hello"), 0x1A4, 0, 0));
+        string img = Path.Combine(Path.GetTempPath(), "hfsreader-test.img");
+        new SweetEmu.Core.Hfs.HfsWriter().Write(tree, img, 64L << 20);
+        try
+        {
+            using var r = new SweetEmu.Core.Hfs.HfsReader(new SweetEmu.Core.IO.FileSource(img));
+            foreach (var p in new[] { "System/Library/Caches/com.apple.dyld/dsc", "private/preboot/Cryptexes/OS/dsc" })
+            {
+                var h = r.Find(p) ?? throw new Exception("not found: " + p);
+                if (h.Length != data.Length) throw new Exception($"{p}: length {h.Length}");
+                if (!r.ReadFork(h, 0, data.Length).AsSpan().SequenceEqual(data)) throw new Exception(p + ": data differs");
+                if (!r.ReadFork(h, 1234567, 100).AsSpan().SequenceEqual(data.AsSpan(1234567, 100))) throw new Exception(p + ": offset read differs");
+            }
+            var s = r.Find("small") ?? throw new Exception("small not found");
+            if (System.Text.Encoding.ASCII.GetString(r.ReadFork(s, 0, 5)) != "hello") throw new Exception("small differs");
+            if (r.Find("nope/x") != null) throw new Exception("found a missing path");
+        }
+        finally { File.Delete(img); }
+    }
+}
