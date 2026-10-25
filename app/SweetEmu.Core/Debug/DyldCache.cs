@@ -251,7 +251,16 @@ public sealed class DyldCache : IDisposable
     public string? Symbolicate(ulong addr)
     {
         var img = ImageFor(addr);
-        if (img == null) return null;
+        string seg = "";
+        if (img == null)
+        {
+            // Not code: an address in some image's data segments (class objects, selector refs...).
+            var hit = SegmentFor(addr);
+            if (hit == null) return null;
+            img = hit.Value.Img;
+            seg = $" [{hit.Value.Seg}]";
+            Parse(img);
+        }
         var syms = img.Symbols!;
         int lo = 0, hi = syms.Count - 1, best = -1;
         while (lo <= hi)
@@ -260,10 +269,37 @@ public sealed class DyldCache : IDisposable
             if (syms[mid].Addr <= addr) { best = mid; lo = mid + 1; }
             else hi = mid - 1;
         }
-        if (best < 0) return $"{img.Name} + 0x{addr - img.Address:x}";
+        if (best < 0) return $"{img.Name} + 0x{addr - img.Address:x}{seg}";
         var (a, n) = syms[best];
         if (n.StartsWith('_')) n = n[1..];
-        return $"{img.Name}`{n} + 0x{addr - a:x}";
+        return $"{img.Name}`{n} + 0x{addr - a:x}{seg}";
+    }
+
+    List<(ulong Start, ulong End, Image Img, string Seg)>? segIndex;
+
+    (Image Img, string Seg)? SegmentFor(ulong addr)
+    {
+        if (segIndex == null)
+        {
+            segIndex = new();
+            foreach (var img in images)
+            {
+                ParseHeader(img);
+                foreach (var sg in img.Segments)
+                    if (sg.Name != "__LINKEDIT" && sg.Name != "__TEXT" && sg.Size > 0)
+                        segIndex.Add((sg.Vm, sg.Vm + sg.Size, img, sg.Name));
+            }
+            segIndex.Sort((a, b) => a.Start.CompareTo(b.Start));
+        }
+        int lo = 0, hi = segIndex.Count - 1, best = -1;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) / 2;
+            if (segIndex[mid].Start <= addr) { best = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        if (best < 0 || addr >= segIndex[best].End) return null;
+        return (segIndex[best].Img, segIndex[best].Seg);
     }
 
     static string Prot(uint p) => $"{((p & 1) != 0 ? 'r' : '-')}{((p & 2) != 0 ? 'w' : '-')}{((p & 4) != 0 ? 'x' : '-')}";

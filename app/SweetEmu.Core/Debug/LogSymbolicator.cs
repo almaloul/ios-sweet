@@ -16,7 +16,7 @@ namespace SweetEmu.Core.Debug;
 public static class LogSymbolicator
 {
     static readonly Regex Header = new(@"^(SMP|CRASH) ([^\[\s]+)\[(\d+)\].*?slide 0x([0-9a-f]+) mh 0x([0-9a-f]+)", RegexOptions.Compiled);
-    static readonly Regex Frames = new(@"^(SMP|CRASH) (\S+) (t\d+ |pc |bt )", RegexOptions.Compiled);
+    static readonly Regex Frames = new(@"^(SMP|CRASH) (\S+) (t\d+ |pc |bt |regs |\[x0\] )", RegexOptions.Compiled);
     static readonly Regex Addr = new(@"0x([0-9a-f]{9,16})", RegexOptions.Compiled);
     const ulong CacheStart = 0x180000000;
 

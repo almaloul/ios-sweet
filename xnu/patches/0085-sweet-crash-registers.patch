@@ -1,0 +1,33 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..c9e373c 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -858,6 +858,28 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
+ 	    (uint64_t)saved_state64(ss)->far);
+ 
++	/* All general registers (objc_msgSend: x0 receiver, x1 selector, x16 class, x17 IMP). */
++	for (int r = 0; r < 29; r += 8) {
++		char rl[220];
++		int rn = snprintf(rl, sizeof(rl), "CRASH %s regs x%d", name, r);
++		for (int k = r; k < r + 8 && k < 29; k++) {
++			rn += snprintf(rl + rn, sizeof(rl) - rn, " 0x%llx", (uint64_t)get_saved_state_reg(ss, (unsigned)k));
++		}
++		printf("%s\n", rl);
++	}
++	if (sig == 11 || sig == 10) {
++		/* x1 as a C string (the selector when the crash came out of objc_msgSend). */
++		char sel[96];
++		vm_size_t done = 0;
++		if (copyinstr((user_addr_t)get_saved_state_reg(ss, 1), sel, sizeof(sel), &done) == 0) {
++			printf("CRASH %s x1 string \"%s\"\n", name, sel);
++		}
++		uint64_t isa[2];
++		if (copyin((user_addr_t)get_saved_state_reg(ss, 0), isa, sizeof(isa)) == 0) {
++			printf("CRASH %s [x0] 0x%llx 0x%llx\n", name, isa[0], isa[1]);
++		}
++	}
++
+ 	char line[200];
+ 	int n = snprintf(line, sizeof(line), "CRASH %s bt", name);
+ 	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
