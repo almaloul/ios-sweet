@@ -92,6 +92,61 @@ public sealed class DyldCache : IDisposable
         var m = ReadAt(s, off, (int)count * 32);
         for (int i = 0; i < count; i++)
             mappings.Add(new Mapping(U64(m, i * 32), U64(m, i * 32 + 8), U64(m, i * 32 + 16), s, name, U32(m, i * 32 + 24), U32(m, i * 32 + 28)));
+        // dyld_cache_mapping_and_slide_info: address, size, fileOffset, slideInfoFileOffset, slideInfoFileSize, flags, maxProt, initProt
+        if (off > 0x13c && U32(hdr, 0x138) != 0)
+        {
+            uint so = U32(hdr, 0x138), sc = U32(hdr, 0x13c);
+            var ms = ReadAt(s, so, (int)sc * 56);
+            for (int i = 0; i < sc; i++)
+                slides.Add((U64(ms, i * 56), U64(ms, i * 56 + 8), U64(ms, i * 56 + 24), U64(ms, i * 56 + 32), U64(ms, i * 56 + 40), name, s));
+        }
+    }
+
+    readonly List<(ulong Address, ulong Size, ulong InfoOff, ulong InfoSize, ulong Flags, string File, Stream S)> slides = new();
+
+    /// The slide info covering an address: "v2 page 0x4000 delta_mask .. value_add .." plus the decoded pointer.
+    string SlideInfo(ulong addr, ulong raw)
+    {
+        var sl = slides.FirstOrDefault(x => addr >= x.Address && addr < x.Address + x.Size);
+        if (sl.File == null) return "  no slide info for this address";
+        if (sl.InfoSize == 0) return $"  mapping-with-slide {sl.File} 0x{sl.Address:x} flags 0x{sl.Flags:x}: no slide info";
+        var h = ReadAt(sl.S, (long)sl.InfoOff, 48);
+        uint ver = U32(h, 0), pageSize = U32(h, 4);
+        var sb = new StringBuilder($"  slide info v{ver} (in {sl.File} at 0x{sl.InfoOff:x}, {sl.InfoSize} bytes) page size 0x{pageSize:x} flags 0x{sl.Flags:x}");
+        if (ver == 2)
+        {
+            ulong deltaMask = U64(h, 24), valueAdd = U64(h, 32);
+            ulong v = raw & ~deltaMask;
+            if (v != 0) v += valueAdd;
+            int pageIndex = (int)((addr - sl.Address) / pageSize);
+            uint startsOff = U32(h, 8), startsCount = U32(h, 12);
+            ushort start = pageIndex < startsCount ? BinaryPrimitives.ReadUInt16LittleEndian(ReadAt(sl.S, (long)sl.InfoOff + startsOff + 2 * pageIndex, 2)) : (ushort)0xffff;
+            sb.Append($"\n  v2 delta_mask 0x{deltaMask:x} value_add 0x{valueAdd:x}: pointer -> unslid 0x{v:x}; page {pageIndex} start 0x{start:x}");
+        }
+        else if (ver == 3)
+        {
+            ulong authAdd = U64(h, 16);
+            ulong v = (raw >> 63) != 0 ? authAdd + (raw & 0xFFFFFFFF) : ((raw & 0x7FFFFFFFFFF) | (((raw >> 43) & 0xff) << 56));
+            sb.Append($"\n  v3 auth_value_add 0x{authAdd:x}: pointer -> unslid 0x{v:x}");
+        }
+        else if (ver == 5)
+        {
+            ulong valueAdd = U64(h, 16);
+            sb.Append($"\n  v5 value_add 0x{valueAdd:x}: pointer -> unslid 0x{valueAdd + (raw & 0x7FFFFFFFF):x}");
+        }
+        return sb.ToString();
+    }
+
+    /// Address of a symbol: "libobjc.A.dylib:_objc_msgSend".
+    public string FindSymbol(string spec)
+    {
+        int c = spec.IndexOf(':');
+        string imgName = spec[..c], sym = spec[(c + 1)..];
+        var img = images.FirstOrDefault(i => i.Name == imgName);
+        if (img == null) return $"{spec}: no image {imgName}";
+        Parse(img);
+        var hits = img.Symbols!.Where(x => x.Name == sym).ToList();
+        return hits.Count == 0 ? $"{spec}: not found" : $"{spec} = " + string.Join(", ", hits.Select(h => $"0x{h.Addr:x}"));
     }
 
     void LoadLocals(Stream sym, ulong lsOff, bool entries64)
@@ -236,7 +291,16 @@ public sealed class DyldCache : IDisposable
         }
         var words = ReadVm(addr & ~3UL, 16);
         if (words != null)
+        {
             sb.AppendLine("  words " + string.Join(" ", Enumerable.Range(0, 4).Select(i => $"{U32(words, i * 4):x8}")));
+            var q = ReadVm(addr & ~7UL, 8);
+            if (q != null)
+            {
+                ulong raw = U64(q, 0);
+                sb.AppendLine($"  u64 at 0x{addr & ~7UL:x} = 0x{raw:x}");
+                sb.AppendLine(SlideInfo(addr & ~7UL, raw));
+            }
+        }
         return sb.ToString();
     }
 

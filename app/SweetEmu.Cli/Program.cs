@@ -109,7 +109,7 @@ public static partial class Commands
           prepare HOME                     build Data/ios16-root.img from HOME/IPSW/*.ipsw
           run HOME [--headless] [--secs N] [--screenshot F] [--discard]   boot it in QEMU
           symbolicate HOME [LOG] [OUT]     name the addresses in SMP/CRASH lines of serial.txt
-          cache-addr HOME ADDR|call:LR...  describe unslid shared-cache addresses (call: = the call before a return address)
+          cache-addr HOME ADDR|call:LR|sym:IMAGE:SYMBOL...  describe unslid shared-cache addresses (call: = the call before a return address)
         """;
 
     public static int Run(string[] args)
@@ -240,6 +240,7 @@ public static partial class Commands
                     using var cache = SweetEmu.Core.Debug.LogSymbolicator.OpenFromIpsw(ipsw, emu.TempDir, Console.WriteLine, keep);
                     foreach (var a in args.Skip(2))
                     {
+                        if (a.StartsWith("sym:")) { Console.WriteLine(cache.FindSymbol(a[4..])); continue; }
                         bool call = a.StartsWith("call:");
                         ulong v = Convert.ToUInt64((call ? a[5..] : a).Replace("0x", ""), 16);
                         Console.WriteLine(call ? cache.DescribeCallBefore(v) : cache.Describe(v));
