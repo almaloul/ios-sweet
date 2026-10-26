@@ -28,6 +28,28 @@ public static class BootTests
     }
 }
 
+public static class VirtSmpTests
+{
+    [Test]
+    public static void AdtHasOneCpuNodePerCoreWithQemuNumbering()
+    {
+        var root = AdtNode.Parse(VirtAdt.Build(null, new byte[64], cpus: 4));
+        var cpus = root.Child("cpus") ?? throw new Exception("no /cpus");
+        if (cpus.Children.Count != 4) throw new Exception($"{cpus.Children.Count} cpu nodes");
+        for (int n = 0; n < 4; n++)
+        {
+            var c = cpus.Children[n];
+            if (c.Name != $"cpu{n}") throw new Exception("name " + c.Name);
+            if (BitConverter.ToUInt32(c.Prop("reg")!) != n) throw new Exception($"cpu{n} reg");
+            if (Encoding.ASCII.GetString(c.Prop("psci-method")!).TrimEnd('\0') != "hvc") throw new Exception("psci-method");
+            if (Encoding.ASCII.GetString(c.Prop("state")!).TrimEnd('\0') != (n == 0 ? "running" : "stopped")) throw new Exception("state");
+        }
+        // One core: no psci-method, so an older kernel (no 0086) still boots.
+        var one = AdtNode.Parse(VirtAdt.Build(null, new byte[64], cpus: 1)).Child("cpus")!;
+        if (one.Children.Count != 1 || one.Children[0].Prop("psci-method") != null) throw new Exception("single-cpu tree changed");
+    }
+}
+
 public static class HfsReaderTests
 {
     [Test]

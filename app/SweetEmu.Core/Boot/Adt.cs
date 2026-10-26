@@ -138,9 +138,15 @@ public static class VirtAdt
             .Select(p => (p.Name, p.Value)).ToList();
     }
 
+    /// Kernel limit (SWEET_SMP_MAX_CPUS).
+    public const int MaxCpus = 8;
+
     /// The --virt tree. d22apAdt: the IPSW's DeviceTree.d22ap payload (for /product).
-    public static byte[] Build(byte[]? d22apAdt, byte[]? seed = null)
+    /// cpus: one cpu node per core, QEMU virt MPIDR numbering (Aff0 = core),
+    /// started through PSCI over HVC (psci-method, kernel patch 0086).
+    public static byte[] Build(byte[]? d22apAdt, byte[]? seed = null, int cpus = 1)
     {
+        if (cpus < 1 || cpus > MaxCpus) throw new ArgumentOutOfRangeException(nameof(cpus));
         var b = new Builder();
         ulong physBase = HighPhysBase, memSize = HighMemSize;
         ulong panicBase = physBase + memSize - PanicLogSize;
@@ -173,29 +179,35 @@ public static class VirtAdt
             b.Node("asmb", new[] { b.Ph(), ("lp-sip0", U64(0x6f)), ("lp-sip1", U32(1)) }),
         });
 
-        // QEMU: one CPU (tools/mkadt.py keeps the single-CPU tree for --qemu).
-        var cpu0 = b.Node("cpu0", new[]
+        // QEMU virt: cpu n has MPIDR n (Aff0). cpu0 keeps mkadt.py's --virt properties.
+        var cpuNodes = new List<AdtNode>();
+        for (uint n = 0; n < cpus; n++)
         {
-            b.Ph(),
-            ("device_type", CStr("cpu")),
-            ("compatible", CStr("qcom,kryo470", "ARM,v8")),
-            ("reg", U32(0)),
-            ("cpu-id", U32(0)),
-            ("cluster-id", U32(0)),
-            ("cluster-type", U32(0)),
-            ("die-cluster-id", U32(0)),
-            ("cluster-core-id", U32(0)),
-            ("l2-cache-id", U32(0)),
-            ("l3-cache-id", U32(0)),
-            ("state", CStr("running")),
-            ("timebase-frequency", U32(QemuTimebase)),
-            ("clock-frequency", U32(1804800000)),
-            ("bus-frequency", U32(100000000)),
-            ("memory-frequency", U32(1866000000)),
-            ("peripheral-frequency", U32(QemuTimebase)),
-            ("fixed-frequency", U32(QemuTimebase)),
-        });
-        var cpus = b.Node("cpus", new[] { b.Ph(), ("#address-cells", U32(1)), ("#size-cells", U32(0)) }, new[] { cpu0 });
+            var props = new List<(string, byte[])>
+            {
+                b.Ph(),
+                ("device_type", CStr("cpu")),
+                ("compatible", CStr("qcom,kryo470", "ARM,v8")),
+                ("reg", U32(n)),
+                ("cpu-id", U32(n)),
+                ("cluster-id", U32(0)),
+                ("cluster-type", U32(0)),
+                ("die-cluster-id", U32(0)),
+                ("cluster-core-id", U32(n)),
+                ("l2-cache-id", U32(n)),
+                ("l3-cache-id", U32(0)),
+                ("state", CStr(n == 0 ? "running" : "stopped")),
+                ("timebase-frequency", U32(QemuTimebase)),
+                ("clock-frequency", U32(1804800000)),
+                ("bus-frequency", U32(100000000)),
+                ("memory-frequency", U32(1866000000)),
+                ("peripheral-frequency", U32(QemuTimebase)),
+                ("fixed-frequency", U32(QemuTimebase)),
+            };
+            if (cpus > 1) props.Add(("psci-method", CStr("hvc")));
+            cpuNodes.Add(b.Node($"cpu{n}", props));
+        }
+        var cpusNode = b.Node("cpus", new[] { b.Ph(), ("#address-cells", U32(1)), ("#size-cells", U32(0)) }, cpuNodes);
 
         var gic = b.Node("gic", new[]
         {
@@ -261,7 +273,7 @@ public static class VirtAdt
         var product = productProps != null ? b.Node("product", new[] { b.Ph() }.Concat(productProps)) : null;
         var pram = b.Node("pram", new[] { b.Ph(), ("reg", U64(panicBase).Concat(U64(PanicLogSize)).ToArray()) });
 
-        var children = new List<AdtNode> { chosen, defaults, cpus, armIo, fbcon, buttons, pram };
+        var children = new List<AdtNode> { chosen, defaults, cpusNode, armIo, fbcon, buttons, pram };
         if (product != null) children.Add(product);
         children.Add(virtio);
         var root = b.Node("device-tree", new[]

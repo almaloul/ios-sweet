@@ -11,7 +11,9 @@ namespace SweetEmu.Core;
 
 public sealed class EmulatorSettings
 {
-    public int Cpus { get; set; } = 1;
+    /// Emulated cores; QEMU runs each on its own host thread. Default: up to 4,
+    /// leaving at least two host threads for QEMU's I/O and the rest of Windows.
+    public int Cpus { get; set; } = Math.Clamp(Environment.ProcessorCount - 2, 1, 4);
     public string? Memory { get; set; }
     public bool DiscardChanges { get; set; }
     public string Display { get; set; } = "gtk";
@@ -22,7 +24,7 @@ public sealed class EmulatorSettings
 public sealed class Emulator
 {
     public const string DefaultBootArgs =
-        "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=vblk0 rootrw=1 " +
+        "debug=0xc serial=3 keepsyms=1 -enable_kprintf_spam -noprogress rd=vblk0 rootrw=1 " +
         "unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 " +
         "wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetsample=SpringBoard,backboardd,lsd";
 
@@ -93,9 +95,10 @@ public sealed class Emulator
     {
         string kernel = FindKernel() ?? throw new FileNotFoundException($"no kernel in {KernelDir}");
         byte[]? d22 = File.Exists(D22apPath) ? File.ReadAllBytes(D22apPath) : null;
-        var adt = VirtAdt.Build(d22);
+        int cpus = Math.Clamp(s.Cpus, 1, VirtAdt.MaxCpus);
+        var adt = VirtAdt.Build(d22, cpus: cpus);
         File.WriteAllBytes(AdtPath, adt);
-        var (payload, _) = Payload.Build(File.ReadAllBytes(kernel), adt, s.BootArgs);
+        var (payload, _) = Payload.Build(File.ReadAllBytes(kernel), adt, $"cpus={cpus} {s.BootArgs}");
         File.WriteAllBytes(Path.Combine(DataDir, "payload-virt.bin"), payload);
         return payload;
     }

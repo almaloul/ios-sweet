@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..e07da48 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -15,6 +15,7 @@
+ #include <kern/clock.h>
+ #include <kern/processor.h>
+ #include <kern/thread.h>
++#include <string.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -25,6 +26,13 @@ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
+ 
++/*
++ * PSCI conduit: SMC on the phone (Qualcomm firmware at EL3); HVC under QEMU
++ * virt, whose built-in PSCI answers HVC when the guest has no EL2/EL3. The
++ * device tree's cpu nodes say psci-method = "hvc" for the latter.
++ */
++static bool sweet_psci_hvc;
++
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+ static int32_t
+ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+@@ -33,9 +41,15 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ 	register uint64_t x1 __asm__("x1") = target;
+ 	register uint64_t x2 __asm__("x2") = entry;
+ 	register uint64_t x3 __asm__("x3") = context;
+-	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+-	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+-	    "x14", "x15", "x16", "x17", "cc", "memory");
++	if (sweet_psci_hvc) {
++		__asm__ volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	} else {
++		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	}
+ 	return (int32_t)x0;
+ }
+ 
+@@ -73,9 +87,17 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	OSData *method = OSDynamicCast(OSData, provider->getProperty("psci-method"));
++	bool virt = method != NULL && method->getLength() >= 3 &&
++	    strncmp((const char *)method->getBytesNoCopy(), "hvc", 3) == 0;
++	if (virt) {
++		sweet_psci_hvc = true;
++	}
++	/* Phone: MPIDR Aff1 = core (0x000-0x500 A55, 0x600/0x700 A76).
++	 * QEMU virt: Aff0 = core (0-7), Aff1 = 0. */
++	bool phone_layout = cpu->phys_id <= 0x700 && (cpu->phys_id & 0xff) == 0;
++	bool virt_layout = virt && cpu->phys_id < SWEET_SMP_MAX_CPUS;
++	if ((!phone_layout && !virt_layout) || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}

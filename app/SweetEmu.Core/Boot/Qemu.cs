@@ -17,7 +17,7 @@ public sealed class QemuOptions
     public int Cpus { get; init; } = 1;
     public string? Memory { get; init; }
     public string Display { get; init; } = "gtk";
-    public string Accel { get; init; } = "tcg,tb-size=1024";
+    public string Accel { get; init; } = "tcg,thread=multi,tb-size=1024";
     public string Cpu { get; init; } = "cortex-a76";
     public bool Snapshot { get; init; }
     public bool Multitouch { get; init; }
