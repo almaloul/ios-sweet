@@ -21,7 +21,7 @@ public static class Lzbitmap
         if (src.Length < 4 || src[0] != (byte)'Z' || src[1] != (byte)'B' || src[2] != (byte)'M' || src[3] != 9)
             throw new InvalidDataException("LZBITMAP: bad magic");
         int s = 4, d = dstPos, end = dstPos + maxOut;
-        int distance = 8;
+        int distance;
         Span<byte> mapBitmap = stackalloc byte[15];
         Span<byte> mapKind = stackalloc byte[15];
 
@@ -42,6 +42,7 @@ public static class Lzbitmap
             Need(src, s + csize);
             if (csize < 15 + 17) throw new InvalidDataException("LZBITMAP: short chunk");
             var c = src.Slice(s, csize);
+            distance = 8; // the repetition period restarts at 8 in every chunk (libzbitmap: state->period = 8)
             int distOff = U24(c, 6), bmOff = U24(c, 9), tokOff = U24(c, 12), litOff = 15;
             int tokEnd = csize - 17;
             if (distOff > csize || bmOff > csize || tokOff > tokEnd) throw new InvalidDataException("LZBITMAP: bad offsets");
