@@ -24,7 +24,7 @@ public sealed class Emulator
     public const string DefaultBootArgs =
         "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=vblk0 rootrw=1 " +
         "unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 " +
-        "wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30";
+        "wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetsample=SpringBoard,backboardd,lsd";
 
     public string Home { get; }
     public string IpswDir => Path.Combine(Home, "IPSW");
