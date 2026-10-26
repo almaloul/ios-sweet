@@ -110,7 +110,7 @@ public static partial class Commands
           run HOME [--headless] [--secs N] [--screenshot F] [--discard]   boot it in QEMU
           symbolicate HOME [LOG] [OUT]     name the addresses in SMP/CRASH lines of serial.txt
           verify-dsc HOME [IMG]            compare the dyld cache files in the root image with the IPSW
-          cache-addr HOME ADDR|call:LR|sym:IMAGE:SYMBOL|dis:ADDR[:N]|mem:ADDR[:N]...  describe unslid shared-cache addresses (call: = the call before a return address)
+          cache-addr HOME ADDR|call:LR|sym:IMAGE:SYMBOL|dis:ADDR[:N]|mem:ADDR[:N]|class:ADDR...  describe unslid shared-cache addresses (call: = the call before a return address)
         """;
 
     public static int Run(string[] args)
@@ -301,6 +301,7 @@ public static partial class Commands
                     foreach (var a in args.Skip(2))
                     {
                         if (a.StartsWith("sym:")) { Console.WriteLine(cache.FindSymbol(a[4..])); continue; }
+                        if (a.StartsWith("class:")) { Console.WriteLine(cache.ObjcClass(Convert.ToUInt64(a[6..].Replace("0x", ""), 16))); continue; }
                         if (a.StartsWith("dis:") || a.StartsWith("mem:"))
                         {
                             var parts = a.Split(':');

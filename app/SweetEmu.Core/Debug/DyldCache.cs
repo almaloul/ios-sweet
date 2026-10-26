@@ -177,6 +177,77 @@ public sealed class DyldCache : IDisposable
         return sb.ToString();
     }
 
+    /// A pointer stored at addr, rebased (unslid) with the v2 slide info of its mapping.
+    ulong Ptr(ulong addr)
+    {
+        var w = ReadVm(addr, 8);
+        if (w == null) return 0;
+        ulong raw = U64(w, 0);
+        var sl = slides.FirstOrDefault(x => addr >= x.Address && addr < x.Address + x.Size);
+        if (sl.File == null || sl.InfoSize == 0) return raw;
+        var h = ReadAt(sl.S, (long)sl.InfoOff, 48);
+        if (U32(h, 0) != 2) return raw;
+        ulong v = raw & ~U64(h, 24);
+        return v == 0 ? 0 : v + U64(h, 32);
+    }
+
+    string VmString(ulong addr)
+    {
+        var b = ReadVm(addr, 1);
+        if (b == null) return "?";
+        var sb = new StringBuilder();
+        for (ulong i = 0; i < 300; i++)
+        {
+            var c = ReadVm(addr + i, 1);
+            if (c == null || c[0] == 0) break;
+            sb.Append((char)c[0]);
+        }
+        return sb.ToString();
+    }
+
+    /// An Objective-C class in the cache: its class_ro and every method with the IMP it resolves to.
+    public string ObjcClass(ulong cls)
+    {
+        var sb = new StringBuilder($"class 0x{cls:x} {Symbolicate(cls)}\n");
+        ulong bits = Ptr(cls + 0x20);
+        ulong ro = bits & 0x00007ffffffffff8UL;
+        var rw = ReadVm(ro, 0x30);
+        if (rw == null) return sb.Append($"  class_ro 0x{ro:x} not mapped\n").ToString();
+        sb.AppendLine($"  class_ro 0x{ro:x} flags 0x{U32(rw, 0):x} name \"{VmString(Ptr(ro + 0x18))}\"");
+        ulong ml = Ptr(ro + 0x20);
+        sb.AppendLine($"  baseMethods 0x{ml:x} {Symbolicate(ml)}");
+        var h = ml == 0 ? null : ReadVm(ml, 8);
+        if (h == null) return sb.ToString();
+        uint entsizeFlags = U32(h, 0), count = U32(h, 4);
+        bool small = (entsizeFlags & 0x80000000) != 0;
+        uint entsize = entsizeFlags & 0xFFFC;
+        sb.AppendLine($"  method list: entsizeAndFlags 0x{entsizeFlags:x} ({(small ? "small/relative" : "big")}, entsize {entsize}), {count} methods");
+        for (uint i = 0; i < count && i < 400; i++)
+        {
+            ulong e = ml + 8 + i * entsize;
+            if (small)
+            {
+                var m = ReadVm(e, 12);
+                if (m == null) break;
+                int nameOff = BinaryPrimitives.ReadInt32LittleEndian(m.AsSpan(0));
+                int impOff = BinaryPrimitives.ReadInt32LittleEndian(m.AsSpan(8));
+                ulong nameField = e, impField = e + 8;
+                ulong imp = (ulong)((long)impField + impOff);
+                // Name: relative to a selector ref (pointer to the string), or directly to the string.
+                ulong target = (ulong)((long)nameField + nameOff);
+                string viaRef = VmString(Ptr(target)), direct = VmString(target);
+                string name = viaRef.Length > 1 && viaRef.All(ch => ch >= 32 && ch < 127) ? viaRef : direct;
+                sb.AppendLine($"  [{i}] {name}  nameOff 0x{(uint)nameOff:x} impOff 0x{(uint)impOff:x} -> imp 0x{imp:x} {Symbolicate(imp)}");
+            }
+            else
+            {
+                ulong sel = Ptr(e), imp = Ptr(e + 16);
+                sb.AppendLine($"  [{i}] {VmString(sel)} -> imp 0x{imp:x} {Symbolicate(imp)}");
+            }
+        }
+        return sb.ToString();
+    }
+
     /// Address of a symbol: "libobjc.A.dylib:_objc_msgSend".
     public string FindSymbol(string spec)
     {
