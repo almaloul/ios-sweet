@@ -110,7 +110,7 @@ public static partial class Commands
           run HOME [--headless] [--secs N] [--screenshot F] [--discard]   boot it in QEMU
           symbolicate HOME [LOG] [OUT]     name the addresses in SMP/CRASH lines of serial.txt
           verify-dsc HOME [IMG]            compare the dyld cache files in the root image with the IPSW
-          cache-addr HOME ADDR|call:LR|sym:IMAGE:SYMBOL...  describe unslid shared-cache addresses (call: = the call before a return address)
+          cache-addr HOME ADDR|call:LR|sym:IMAGE:SYMBOL|dis:ADDR[:N]|mem:ADDR[:N]...  describe unslid shared-cache addresses (call: = the call before a return address)
         """;
 
     public static int Run(string[] args)
@@ -301,6 +301,15 @@ public static partial class Commands
                     foreach (var a in args.Skip(2))
                     {
                         if (a.StartsWith("sym:")) { Console.WriteLine(cache.FindSymbol(a[4..])); continue; }
+                        if (a.StartsWith("dis:") || a.StartsWith("mem:"))
+                        {
+                            var parts = a.Split(':');
+                            ulong at = Convert.ToUInt64(parts[1].Replace("0x", ""), 16);
+                            int n = parts.Length > 2 ? int.Parse(parts[2]) : 16;
+                            Console.WriteLine(a[..3] + " 0x" + at.ToString("x") + ":");
+                            Console.WriteLine(a.StartsWith("dis:") ? cache.Words(at, n) : cache.Qwords(at, n));
+                            continue;
+                        }
                         bool call = a.StartsWith("call:");
                         ulong v = Convert.ToUInt64((call ? a[5..] : a).Replace("0x", ""), 16);
                         Console.WriteLine(call ? cache.DescribeCallBefore(v) : cache.Describe(v));

@@ -137,6 +137,46 @@ public sealed class DyldCache : IDisposable
         return sb.ToString();
     }
 
+    /// count instruction words from addr, one per line.
+    public string Words(ulong addr, int count)
+    {
+        var w = ReadVm(addr, count * 4);
+        if (w == null) return $"0x{addr:x}: not mapped";
+        var sb = new StringBuilder();
+        for (int i = 0; i < count; i++)
+        {
+            ulong a = addr + (ulong)(i * 4);
+            sb.AppendLine($"  0x{a:x}: {U32(w, i * 4):x8}{(Symbolicate(a) is { } n && n.EndsWith(" + 0x0") ? "   <" + n + ">" : "")}");
+        }
+        return sb.ToString();
+    }
+
+    /// count u64 values from addr, raw and as rebased pointers (unslid) where slide info applies.
+    public string Qwords(ulong addr, int count)
+    {
+        var w = ReadVm(addr, count * 8);
+        if (w == null) return $"0x{addr:x}: not mapped";
+        var sb = new StringBuilder();
+        for (int i = 0; i < count; i++)
+        {
+            ulong a = addr + (ulong)(i * 8), raw = U64(w, i * 8);
+            var sl = slides.FirstOrDefault(x => a >= x.Address && a < x.Address + x.Size);
+            string dec = "";
+            if (sl.File != null && sl.InfoSize > 0)
+            {
+                var h = ReadAt(sl.S, (long)sl.InfoOff, 48);
+                if (U32(h, 0) == 2)
+                {
+                    ulong v = raw & ~U64(h, 24);
+                    if (v != 0) v += U64(h, 32);
+                    dec = $"  ptr 0x{v:x}" + (v != 0 && Symbolicate(v) is { } n ? "  " + n : "");
+                }
+            }
+            sb.AppendLine($"  0x{a:x}: 0x{raw:x16}{dec}");
+        }
+        return sb.ToString();
+    }
+
     /// Address of a symbol: "libobjc.A.dylib:_objc_msgSend".
     public string FindSymbol(string spec)
     {
